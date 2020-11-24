@@ -491,21 +491,20 @@ impl<'a> DescrombleCheck<'a> {
     }
 }
 
-enum BlockRead {
+enum BlockRead<'a> {
     ReadErr(std::io::Error),
-    FullBlock(Zeroizing<Block>),
-    FinalBlock(Zeroizing<Vec<u8>>),
+    FullBlock(&'a Block),
+    FinalBlock(&'a [u8]),
 }
 
-fn read_block(rd: &mut impl std::io::Read) -> BlockRead {
+fn read_block<'a>(rd: &mut impl std::io::Read, ret: &'a mut Zeroizing<Block>) -> BlockRead<'a> {
     use BlockRead::*;
-    let mut ret = Block::zero();
     let mut bytes_read = 0;
     while bytes_read < ret.0.len() {
         match rd.read(&mut ret.0[bytes_read..]) {
             Ok(0) => {
-                return FinalBlock(ret.0[..bytes_read].iter().cloned()
-                                     .collect::<Vec<_>>().into());
+                for x in ret.0[bytes_read..].iter_mut() { *x = 0u8; }
+                return FinalBlock(&ret.0[..bytes_read]);
             },
             Ok(n) => {
                 assert!(n <= ret.0.len()-bytes_read);
@@ -520,7 +519,7 @@ fn read_block(rd: &mut impl std::io::Read) -> BlockRead {
 
     assert!(bytes_read == ret.0.len());
 
-    FullBlock(ret.into())
+    FullBlock(&*ret)
 }
 
 fn main() -> Result<(),Box<dyn std::error::Error>> {
@@ -535,18 +534,18 @@ fn main() -> Result<(),Box<dyn std::error::Error>> {
             let mut infile = std::io::BufReader::new(File::open(&file)?);
             let writer = Box::new(&mut stdout_lock);
             let mut scrombler = Scrombler::new(password,writer)?;
+            let mut block = Zeroizing::new(Block::zero());
             let mut last_block = None;
 
             while last_block.is_none() {
-                match read_block(&mut infile) {
+                match read_block(&mut infile,&mut block) {
                     BlockRead::ReadErr(e) => { return Err(e.into()); },
-                    BlockRead::FullBlock(mut b) => {
+                    BlockRead::FullBlock(b) => {
                         scrombler.encrypt_block(
-                            Plaintext(std::mem::replace(&mut b,
-                                                        Block::zero())))?;
+                            Plaintext(b.clone()))?;
                     },
                     BlockRead::FinalBlock(b) => {
-                        last_block = Some(b)
+                        last_block = Some(Zeroizing::new(b.iter().cloned().collect::<Vec<_>>()))
                     },
                 }
             }
@@ -558,16 +557,19 @@ fn main() -> Result<(),Box<dyn std::error::Error>> {
         } => {
             let mut infile = std::io::BufReader::new(File::open(&file)?);
             let writer = Box::new(&mut stdout_lock);
+            let mut block1 = Zeroizing::new(Block::zero());
+            let mut block2 = Zeroizing::new(Block::zero());
+            let mut block3 = Zeroizing::new(Block::zero());
 
             let mut descrombler = {
-                let blk1 = match read_block(&mut infile) {
+                let blk1 = match read_block(&mut infile,&mut block1) {
                     BlockRead::ReadErr(e)
                         => Err(Box::<dyn std::error::Error>::from(e)),
                     BlockRead::FullBlock(b) => Ok(b),
                     BlockRead::FinalBlock(_)
                         => Err(ScrombleError::BadLength.into()),
                 }?;
-                let blk2 = match read_block(&mut infile) {
+                let blk2 = match read_block(&mut infile,&mut block2) {
                     BlockRead::ReadErr(e)
                         => Err(Box::<dyn std::error::Error>::from(e)),
                     BlockRead::FullBlock(b) => Ok(b),
@@ -579,13 +581,13 @@ fn main() -> Result<(),Box<dyn std::error::Error>> {
                 let mut last_block = None;
 
                 while last_block.is_none() {
-                    match read_block(&mut infile) {
+                    match read_block(&mut infile,&mut block3) {
                         BlockRead::ReadErr(e) => { return Err(e.into()); },
                         BlockRead::FullBlock(b) => {
                             checker.add_block((*b).clone());
                         },
                         BlockRead::FinalBlock(b) => {
-                            last_block = Some(b)
+                            last_block = Some(Zeroizing::new(b.iter().cloned().collect::<Vec<_>>()))
                         },
                     }
                 }
@@ -601,14 +603,14 @@ fn main() -> Result<(),Box<dyn std::error::Error>> {
             infile.seek(SeekFrom::Start(0))?;
 
             {
-                let /*blk1*/ _ = match read_block(&mut infile) {
+                let /*blk1*/ _ = match read_block(&mut infile,&mut block1) {
                     BlockRead::ReadErr(e)
                         => Err(Box::<dyn std::error::Error>::from(e)),
                     BlockRead::FullBlock(b) => Ok(b),
                     BlockRead::FinalBlock(_)
                         => Err(ScrombleError::BadLength.into()),
                 }?;
-                let /*blk2*/ _ = match read_block(&mut infile) {
+                let /*blk2*/ _ = match read_block(&mut infile,&mut block2) {
                     BlockRead::ReadErr(e)
                         => Err(Box::<dyn std::error::Error>::from(e)),
                     BlockRead::FullBlock(b) => Ok(b),
@@ -619,13 +621,13 @@ fn main() -> Result<(),Box<dyn std::error::Error>> {
                 let mut last_block = None;
 
                 while last_block.is_none() {
-                    match read_block(&mut infile) {
+                    match read_block(&mut infile,&mut block3) {
                         BlockRead::ReadErr(e) => { return Err(e.into()); },
                         BlockRead::FullBlock(b) => {
                             descrombler.add_block((*b).clone())?;
                         },
                         BlockRead::FinalBlock(b) => {
-                            last_block = Some(b)
+                            last_block = Some(Zeroizing::new(b.iter().cloned().collect::<Vec<_>>()))
                         },
                     }
                 }
