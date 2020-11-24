@@ -4,6 +4,9 @@ version = "0.1.0"
 authors = ["Joe Doyle <joethedoyle@protonmail.com>"]
 edition = "2018"
 
+[profile.release]
+lto = "fat"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

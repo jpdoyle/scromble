@@ -79,10 +79,10 @@ to a multiple of 64 bytes.
 Is this fast?
 =============
 
-On my machine I'm seeing encryption speeds of 60MB/s and decryption
-speeds of 50MB/s (decryption requires reading the whole file twice).
-It can probably be made faster, either through simple optimizations or
-by multithreading it.
+On my machine I'm seeing encryption and decryption speeds of
+75-100MB/s when measured through `iotop` -- although, decryption will
+require reading the whole file twice. It can probably be made faster,
+either through simple optimizations or by multithreading it.
 
 Is this reliable?
 =================

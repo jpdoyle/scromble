@@ -207,10 +207,10 @@ fn derive_cipher_and_mac(pw: Passphrase, salt: &Salt,nonce: &Nonce)
     Ok((cipher,mac_state))
 }
 
-struct Scrombler {
+struct Scrombler<'a> {
     cipher: chacha20::XChaCha20,
     mac_state: blake2b_simd::State,
-    writer: Box<dyn std::io::Write>,
+    writer: Box<dyn std::io::Write + 'a>,
 }
 
 /// From https://docs.rs/subtle/2.3.0/src/subtle/lib.rs.html#138
@@ -242,8 +242,8 @@ fn black_box(input: u8) -> u8 {
     }
 }
 
-impl Scrombler {
-    fn new(pw: Passphrase, writer: Box<dyn std::io::Write>)
+impl<'a> Scrombler<'a> {
+    fn new(pw: Passphrase, writer: Box<dyn std::io::Write + 'a>)
             -> Result<Self,Box<dyn std::error::Error>> {
         let salt = Salt::new_random();
         let nonce = Nonce::new_random();
@@ -346,7 +346,7 @@ impl Scrombler {
     }
 }
 
-struct Descrombler {
+struct Descrombler<'a> {
     // cipher is stepped to prev_prev_block (if some)
     cipher: chacha20::XChaCha20,
     // Keep the prev of each so that you can compare the final hash to the
@@ -358,10 +358,10 @@ struct Descrombler {
     // yes, it sucks. Still a little better than remembering if [0] is the
     // newest or the oldest
     prev_blocks: Option<(Ciphertext,Option<(Ciphertext,Option<Ciphertext>)>)>,
-    writer: Box<dyn std::io::Write>,
+    writer: Box<dyn std::io::Write + 'a>,
 }
 
-impl Descrombler {
+impl<'a> Descrombler<'a> {
     fn add_block(&mut self, blk: Block)
             -> Result<(), Box<dyn std::error::Error>> {
         let blk = Ciphertext(blk);
@@ -418,14 +418,14 @@ impl Descrombler {
 }
 
 // this checks the mac
-struct DescrombleCheck {
-    descromble: Descrombler,
+struct DescrombleCheck<'a> {
+    descromble: Descrombler<'a>,
     prev_mac_state: blake2b_simd::State,
     prev_block: Option<Block>,
 }
 
-impl DescrombleCheck {
-    fn new(pw: Passphrase, writer: Box<dyn std::io::Write>, blk1: Block,
+impl<'a> DescrombleCheck<'a> {
+    fn new(pw: Passphrase, writer: Box<dyn std::io::Write + 'a>, blk1: Block,
            blk2: Block)
             -> Result<Self,Box<dyn std::error::Error>> {
         let salt = Salt(blk1.clone());
@@ -474,7 +474,7 @@ impl DescrombleCheck {
     }
 
     fn finalize(self)
-            -> Result<Descrombler,Box<dyn std::error::Error>> {
+            -> Result<Descrombler<'a>,Box<dyn std::error::Error>> {
 
         match self.prev_block.as_ref() {
             None => { return Err(ScrombleError::BadLength.into()); }
@@ -526,12 +526,14 @@ fn read_block(rd: &mut impl std::io::Read) -> BlockRead {
 fn main() -> Result<(),Box<dyn std::error::Error>> {
     let args = Command::from_args();
     let password = Passphrase(rpassword::read_password()?);
+    let stdout = std::io::stdout();
+    let mut stdout_lock = stdout.lock();
     match args {
         Command::Encrypt {
             file,
         } => {
-            let mut infile = File::open(&file)?;
-            let writer = Box::new(std::io::stdout());
+            let mut infile = std::io::BufReader::new(File::open(&file)?);
+            let writer = Box::new(&mut stdout_lock);
             let mut scrombler = Scrombler::new(password,writer)?;
             let mut last_block = None;
 
@@ -554,8 +556,8 @@ fn main() -> Result<(),Box<dyn std::error::Error>> {
         Command::Decrypt {
             file,
         } => {
-            let mut infile = File::open(&file)?;
-            let writer = Box::new(std::io::stdout());
+            let mut infile = std::io::BufReader::new(File::open(&file)?);
+            let writer = Box::new(&mut stdout_lock);
 
             let mut descrombler = {
                 let blk1 = match read_block(&mut infile) {
