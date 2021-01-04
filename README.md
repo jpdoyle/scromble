@@ -87,7 +87,7 @@ Is this fast?
 =============
 
 On my machine I'm seeing encryption and decryption speeds of
-75-100MB/s when measured through `iotop` -- although, decryption will
+200-240MB/s when measured through `iotop` -- although, decryption will
 require reading the whole file twice. It can probably be made faster,
 either through simple optimizations or by multithreading it.
 
