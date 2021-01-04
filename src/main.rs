@@ -372,6 +372,7 @@ impl<'a> Scrombler<'a> {
         blake2b_finalize(self.mac_state);
 
         self.writer.write_all(&(mac.0).0)?;
+        self.writer.flush()?;
 
         Ok(())
     }
@@ -442,6 +443,7 @@ impl<'a> Descrombler<'a> {
                                 - num_skipped;
             self.writer.write_all(
                 &(last_data_block.0).0[..num_not_skipped])?;
+            self.writer.flush()?;
             Ok(())
         } else {
             Err(ScrombleError::BadLength.into())
@@ -560,7 +562,7 @@ fn main() -> Result<(),Box<dyn std::error::Error>> {
     let args = Command::from_args();
     let password = Passphrase(rpassword::read_password()?);
     let stdout = std::io::stdout();
-    let mut stdout_lock = stdout.lock();
+    let mut stdout_lock = std::io::BufWriter::new(stdout.lock());
     match args {
         Command::Encrypt {
             file,
