@@ -20,6 +20,11 @@ Running `nix-shell --command 'cargo build --release'` should work. The
 executable will then be in `./target/release/scromble`. Please file an
 issue if that doesn't work!
 
+If you would like to use the AVX2 backend for XChaCha20, build with
+`nix-shell --command 'RUSTFLAGS="-Ctarget-cpu=haswell
+-Ctarget-feature=+sse2" cargo build --release'` instead. Everything
+else should be the same.
+
 Example usage
 =============
 
@@ -87,9 +92,10 @@ Is this fast?
 =============
 
 On my machine I'm seeing encryption and decryption speeds of
-200-240MB/s when measured through `iotop` -- although, decryption will
-require reading the whole file twice. It can probably be made faster,
-either through simple optimizations or by multithreading it.
+150-180MB/s (default `sse2` backend) and 200-240MB/s (`avx2` backend)
+when measured through `iotop` -- although, decryption will require
+reading the whole file twice. It can probably be made faster, either
+through simple optimizations or by multithreading it.
 
 Is this reliable?
 =================
