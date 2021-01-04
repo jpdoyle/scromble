@@ -55,6 +55,13 @@ MAC is done with 64-byte-output `blake2b`, personalized with
 `b"sCrOmBlEnCrYpToR"`. Its key is generated from the first 32 bytes of
 the XChaCha20 keystream.
 
+Currently, this also includes a hack:
+
+If the keystream extends to `chacha20::MAX_BLOCKS/2` (ie, `2^31`,
+about 128gb), it generates a key and a nonce from the keystream, and
+uses those to reinitialize XChaCha20. This can happen an unlimited
+number of times.
+
 What do encrypted files look like?
 ==================================
 
