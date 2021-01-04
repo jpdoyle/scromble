@@ -119,11 +119,32 @@ struct Key(chacha20::Key);
 #[zeroize(drop)]
 struct Plaintext(Block);
 
+const BLOCKS_PER_STEP: u64 = chacha20::MAX_BLOCKS as u64/2;
+
+fn refresh_cipher(cipher: &mut chacha20::XChaCha20)
+        -> Result<(), Box<dyn std::error::Error>> {
+    let mut new_key = Key(Default::default());
+    let mut new_nonce = Nonce(Default::default());
+    cipher.try_apply_keystream(&mut new_key.0)?;
+    cipher.try_apply_keystream(&mut new_nonce.0)?;
+    *cipher = chacha20::XChaCha20::new(&new_key.0,&new_nonce.0);
+    Ok(())
+}
+
 impl Plaintext {
-    fn encrypt(mut self,  cipher: &mut chacha20::XChaCha20)
+    fn encrypt(mut self,  cipher: &mut chacha20::XChaCha20,
+               blocks_avail: &mut u64)
             -> Result<Ciphertext, Box<dyn std::error::Error>> {
         let mut blk = mem::replace(&mut self.0,Block::zero());
+        if *blocks_avail == 0 {
+            refresh_cipher(cipher)?;
+            *blocks_avail = BLOCKS_PER_STEP;
+        }
+
+        // cipher.apply_keystream(&mut blk.0);
         cipher.try_apply_keystream(&mut blk.0)?;
+        *blocks_avail -= 1;
+
         Ok(Ciphertext(blk))
     }
 }
@@ -132,10 +153,18 @@ impl Plaintext {
 struct Ciphertext(Block);
 
 impl Ciphertext {
-    fn decrypt(self,  cipher: &mut chacha20::XChaCha20)
+    fn decrypt(self,  cipher: &mut chacha20::XChaCha20,
+               blocks_avail: &mut u64)
             -> Result<Plaintext, Box<dyn std::error::Error>> {
         let mut blk = self.0;
+        if *blocks_avail == 0 {
+            refresh_cipher(cipher)?;
+            *blocks_avail = BLOCKS_PER_STEP;
+        }
+
+        // cipher.apply_keystream(&mut blk.0);
         cipher.try_apply_keystream(&mut blk.0)?;
+        *blocks_avail -= 1;
         Ok(Plaintext(blk))
     }
 }
@@ -209,6 +238,7 @@ fn derive_cipher_and_mac(pw: Passphrase, salt: &Salt,nonce: &Nonce)
 
 struct Scrombler<'a> {
     cipher: chacha20::XChaCha20,
+    blocks_avail: u64,
     mac_state: blake2b_simd::State,
     writer: Box<dyn std::io::Write + 'a>,
 }
@@ -253,6 +283,7 @@ impl<'a> Scrombler<'a> {
 
         let mut ret = Self {
             cipher,
+            blocks_avail: BLOCKS_PER_STEP,
             mac_state,
             writer,
         };
@@ -291,7 +322,7 @@ impl<'a> Scrombler<'a> {
 
     fn encrypt_block(&mut self, blk: Plaintext)
             -> Result<(),Box<dyn std::error::Error>> {
-        let ciphertext = blk.encrypt(&mut self.cipher)?;
+        let ciphertext = blk.encrypt(&mut self.cipher, &mut self.blocks_avail)?;
         self.internal_write_block(ciphertext.0)?;
         Ok(())
     }
@@ -349,6 +380,7 @@ impl<'a> Scrombler<'a> {
 struct Descrombler<'a> {
     // cipher is stepped to prev_prev_block (if some)
     cipher: chacha20::XChaCha20,
+    blocks_avail: u64,
     // Keep the prev of each so that you can compare the final hash to the
     // final block
     prev_mac_state: blake2b_simd::State,
@@ -376,7 +408,7 @@ impl<'a> Descrombler<'a> {
                             self.writer
                                 .write_all(
                                     &(prevprevprev.clone().decrypt(
-                                        &mut self.cipher)?.0).0)?
+                                        &mut self.cipher, &mut self.blocks_avail)?.0).0)?
                         }
                         *rest = Some(prevprev.clone());
 
@@ -399,8 +431,8 @@ impl<'a> Descrombler<'a> {
             }
             blake2b_finalize(self.prev_mac_state);
             let last_data_block = last_data_block
-                .decrypt(&mut self.cipher)?;
-            let skip_block = skip_block.decrypt(&mut self.cipher)?;
+                .decrypt(&mut self.cipher, &mut self.blocks_avail)?;
+            let skip_block = skip_block.decrypt(&mut self.cipher, &mut self.blocks_avail)?;
             // TODO
             // self.cipher.zeroize();
             // skipping 0 and skipping BLOCK_SIZE are both "reasonable"
@@ -457,6 +489,7 @@ impl<'a> DescrombleCheck<'a> {
         let ret = DescrombleCheck {
             descromble: Descrombler {
                 cipher, prev_mac_state: mac_state.clone(),
+                blocks_avail: BLOCKS_PER_STEP,
                 prev_blocks: None,
                 writer,
             },
