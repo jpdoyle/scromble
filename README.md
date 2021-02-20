@@ -1,4 +1,5 @@
 ![have your datums been scrombled?](./scrombled-edit.png)
+
 `scromble`, a simple authenticated file encryptor.
 ==================================================
 
