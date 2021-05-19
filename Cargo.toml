@@ -1,8 +1,11 @@
 [package]
 name = "scromble"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["Joe Doyle <joethedoyle@protonmail.com>"]
 edition = "2018"
+
+# [build]
+# rustflags = ["-Ctarget-cpu=haswell","-Ctarget-feature=+sse2"]
 
 [profile.release]
 lto = "fat"
@@ -13,10 +16,10 @@ lto = "fat"
 structopt = { version = "0.3" }
 rust-argon2 = { version = "0.8.2" }
 blake2b_simd = { version = "^0.5" }
-chacha20 = { version = "0.6.0", features = [ "xchacha20","zeroize" ] }
+chacha20 = { version = "0.7.0", features = [ "xchacha","zeroize" ] }
 zeroize = { version = "1.1.1", features = [ "zeroize_derive" ] }
 rpassword = "5.0"
 rand = "0.7.3"
 generic-array = "0.14.4"
-cipher = { version = "0.2.5", features = [ "std" ] }
+cipher = { version = "0.3.0", features = [ "std" ] }
 

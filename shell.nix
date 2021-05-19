@@ -8,7 +8,7 @@ in
 let
   pkgs = nixpkgs;
   channel = "nightly";
-  date = "2020-10-16";
+  date = "2021-04-17";
   targets = [ ];
   chan = (pkgs.rustChannelOfTargets channel date targets
          ).override {
