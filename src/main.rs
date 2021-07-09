@@ -14,6 +14,7 @@ use std::fs::File;
 use std::fmt;
 use std::io::Seek;
 use std::io::SeekFrom;
+mod f512_569;
 
 #[test]
 fn argon2i_config() {

@@ -23,3 +23,7 @@ rand = "0.7.3"
 generic-array = "0.14.4"
 cipher = { version = "0.3.0", features = [ "std" ] }
 
+[dev-dependencies]
+num = ""
+quickcheck = ""
+

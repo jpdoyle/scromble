@@ -1,5 +1,97 @@
+
+#[derive(Debug,Clone,Default)]
+struct F512_569([u64; 10]);
+
+impl F512_569 {
+
+    /// Reduce the limbs to be <2^51, except:
+    ///  - the last limb will be <2^53
+    ///  - the first limb may be between 2^51 and 2^53.
+    /// Assumes that all limbs are below 2^63.
+    fn reduce(&mut self) {
+        for i in 0..9 {
+            let carry = self.0[i]>>51;
+            self.0[i+1] += carry;
+            self.0[i] &= (1<<51)-1;
+        }
+        let final_carry = self.0[9]>>53;
+        self.0[9] &= (1<<53)-1;
+        self.0[0] += final_carry*569;
+    }
+
+    /// Fully reduce the limbs to be <2^51, except the last limb, which is
+    /// <2^53.
+    /// Assumes that all limbs are below 2^63.
+    fn reduce_full(&mut self) {
+        self.reduce();
+        // Now all but the first limb are in reduced form, and there's at
+        // most 1 carry bit in the first limb.
+        self.reduce();
+
+        // If all limbs above the first were at their maximum value, we may
+        // have one more carry bit in the first limb.
+        //
+        // But in that case, and we know that the second limb is now zero.
+        self.0[1] += 569*(self.0[0]>>51);
+        self.0[0] &= (1<<51)-1;
+
+        for i in 0..9 {
+            debug_assert!(self.0[i] < 1<<51);
+        }
+        debug_assert!(self.0[9] < 1<<53);
+    }
+}
+
+impl From<&F512_569> for [u8;64] {
+    fn from(v: &F512_569) -> [u8;64] {
+        let mut ret = [0;64];
+        let mut v = v.clone();
+        v.reduce_full();
+
+        let mut out_ix = 0;
+        let mut bits_avail = 0;
+        let mut curr = 0;
+        for i in 0..10 {
+            curr |= v.0[i]<<bits_avail;
+            bits_avail += if i == 9 { 53 } else { 51 };
+            while bits_avail >= 8 {
+                ret[out_ix] = (curr&0xff) as u8;
+                out_ix += 1;
+                curr >>= 8;
+                bits_avail -= 8;
+            }
+        }
+        debug_assert_eq!(bits_avail,0);
+        debug_assert_eq!(out_ix,64);
+        debug_assert_eq!(curr,0);
+        ret
+    }
+}
+
+impl From<&[u8;64]> for F512_569 {
+    fn from(arr: &[u8;64]) -> F512_569 {
+        let mut ret = F512_569([0;10]);
+
+        let mut in_ix = 0;
+        let mut shift = 0;
+        for i in 0..10 {
+            while in_ix < 64 && shift < 64-8 {
+                ret.0[i] |= (arr[in_ix] as u64)<<shift;
+                shift += 8;
+                in_ix += 1;
+            }
+            shift -= if i == 9 { 53 } else { 51 };
+        }
+
+        ret.reduce();
+        ret
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use super::*;
+    use quickcheck::quickcheck;
     use num::BigInt;
 
     enum PrattCert {
@@ -56,6 +148,36 @@ mod test {
         }
     }
 
+    #[allow(non_snake_case)]
+    fn to_from_F512_569(v: Vec<u8>) {
+        let arr: [u8;64] = {
+            let mut ret = [0;64];
+            for (i,x) in v.into_iter().enumerate() {
+                if i >= 64 {
+                    break;
+                }
+                ret[i] = x;
+            }
+            ret
+        };
+        {
+            let f = F512_569::from(&arr);
+            let arr2 = <[u8;64]>::from(&f);
+            let f2 = F512_569::from(&arr2);
+            assert_eq!(<[u8;64]>::from(&f2),arr2);
+        }
+        {
+            let mut arr_no_wrap = arr.clone();
+            arr_no_wrap[63] >>= 2;
+            let f = F512_569::from(&arr_no_wrap);
+            assert_eq!(<[u8;64]>::from(&f),arr_no_wrap);
+        }
+    }
+
+    #[test]
+    fn quickcheck_to_from_f512_569() {
+        quickcheck(to_from_F512_569 as fn(_) -> ());
+    }
 
     #[test]
     fn prime_2_512_569() {
