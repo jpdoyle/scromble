@@ -62,10 +62,10 @@ mixed with a 64-byte salt.
 Encryption is done with `XChaCha20`, with a 24 byte (192bit) nonce. In
 "legacy" mode a hack is used when the keystream becomes very large:
 
-If the keystream extends to `core::u32::MAX/2` (ie, `2^31`,
-about 128gb), it generates a key and a nonce from the keystream, and
-uses those to reinitialize XChaCha20. This can happen an unlimited
-number of times.
+- If the keystream extends to `core::u32::MAX/2` (ie, `2^31`, about
+  128gb), it generates a key and a nonce from the keystream, and uses
+  those to reinitialize XChaCha20. This can happen an unlimited number
+  of times.
 
 MAC is done with 64-byte-output `blake2b`, personalized with
 `b"sCrOmBlEnCrYpToR"`. Its key is generated from the first 32 bytes of
