@@ -468,6 +468,7 @@ dependencies = [
  "chacha20",
  "cipher",
  "generic-array",
+ "lazy_static",
  "num",
  "quickcheck",
  "rand 0.7.3",

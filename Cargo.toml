@@ -26,4 +26,5 @@ cipher = { version = "0.3.0", features = [ "std" ] }
 [dev-dependencies]
 num = ""
 quickcheck = ""
+lazy_static = ""
 

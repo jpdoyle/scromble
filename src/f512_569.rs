@@ -1,5 +1,7 @@
+use crate::util;
 
-#[derive(Debug,Clone,Default)]
+#[derive(Debug,Clone,Default,Zeroize)]
+#[zeroize(drop)]
 struct F512_569([u64; 10]);
 
 impl F512_569 {
@@ -34,6 +36,28 @@ impl F512_569 {
         // But in that case, and we know that the second limb is now zero.
         self.0[1] += 569*(self.0[0]>>51);
         self.0[0] &= (1<<51)-1;
+
+        // Try to subtract out 2^512 - 569
+        let mut reduced = [0u64; 10];
+        reduced[0] = self.0[0] + 569;
+        for i in 0..9 {
+            let carry = reduced[i]>>51;
+            reduced[i] &= (1<<51)-1;
+            reduced[i+1] = self.0[i+1] + carry;
+        }
+        let final_carry = ((reduced[9]>>53)&1) as u8;
+        let final_carry = util::black_box(final_carry);
+
+        for i in 0..10 {
+            let l = self.0[i];
+            let r = reduced[i];
+            let mask = util::black_box(final_carry.wrapping_neg());
+            let mask = mask as u64;
+            let mask = mask | (mask<<8);
+            let mask = mask | (mask<<16);
+            let mask = mask | (mask<<32);
+            self.0[i] = ((!mask)&l) | (mask&r);
+        }
 
         for i in 0..9 {
             debug_assert!(self.0[i] < 1<<51);
@@ -92,8 +116,25 @@ impl From<&[u8;64]> for F512_569 {
 mod test {
     use super::*;
     use quickcheck::quickcheck;
-    use num::BigInt;
+    use num::{BigInt,bigint::Sign};
 
+    lazy_static! {
+        static ref P512_569: BigInt = BigInt::from(2).pow(512)-BigInt::from(569);
+    }
+
+    // A Pratt certificate for `p` is a proof that there is some value
+    // 2 < g < p such that:
+    //  - g^(p-1) == 1 mod p
+    //  - for each prime factor q of `p-1`, `g^((p-1)/q) != 1 mod p`
+    // This proves that g's order mod p is `p-1`, which is only possible if
+    // `p` is prime. (since if q|p, q|(q^(p-1) mod p), but also for some r,
+    // q = g^r mod p, so
+    // q^(p-1) = (g^r)^(p-1) = (g^(p-1))^r = 1^r = 1 mod p
+    // and thus q|1).
+    //
+    // The prime factors q recursively have their own certificates, until
+    // they are less than `1000^2`, at which point exhaustive checking up
+    // to `~sqrt(q)` is done.
     enum PrattCert {
         Small,
         Cert {
@@ -105,8 +146,11 @@ mod test {
     fn check_pratt_cert(p: BigInt, cert: PrattCert) -> Result<(),()> {
         match cert {
             PrattCert::Small => {
+                if BigInt::from(1000).pow(2) < p {
+                    return Err(());
+                }
                 let mut ret = Ok(());
-                for i in 2..1000 {
+                for i in 2..=1000 {
                     let i = BigInt::from(i);
                     if i.pow(2) > p {
                         break;
@@ -165,12 +209,29 @@ mod test {
             let arr2 = <[u8;64]>::from(&f);
             let f2 = F512_569::from(&arr2);
             assert_eq!(<[u8;64]>::from(&f2),arr2);
+            let bi_arr  = BigInt::from_radix_le(Sign::Plus,&arr, 256).unwrap();
+            let bi_arr2 = BigInt::from_radix_le(Sign::Plus,&arr2,256).unwrap();
+            assert_eq!(bi_arr%P512_569.clone(), bi_arr2);
         }
         {
             let mut arr_no_wrap = arr.clone();
-            arr_no_wrap[63] >>= 2;
+            arr_no_wrap[0] &= !((569u32 & 0xff) as u8);
+            arr_no_wrap[1] &= !(((569u32>>8)&0xff) as u8);
             let f = F512_569::from(&arr_no_wrap);
             assert_eq!(<[u8;64]>::from(&f),arr_no_wrap);
+        }
+    }
+
+    #[test]
+    fn edge_cases_to_from_f512_569() {
+        to_from_F512_569(vec![0]);
+        for i in 0..=569u16 {
+            let mut arr = vec![0xff;64];
+            let b1 = (i&0xff) as u8;
+            let b2 = (i>>8) as u8;
+            arr[0] -= b1;
+            arr[1] -= b2;
+            to_from_F512_569(arr);
         }
     }
 
@@ -184,7 +245,7 @@ mod test {
         use PrattCert::*;
         let pb = |x| BigInt::parse_bytes(x,10).unwrap();
         check_pratt_cert(
-            BigInt::from(2).pow(512)-BigInt::from(569),
+            P512_569.clone(),
 
 	    Cert {
 		factorization: vec![
