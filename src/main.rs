@@ -13,7 +13,7 @@ use std::mem;
 use std::fs::File;
 use std::fmt;
 use std::io::Seek;
-use std::io::SeekFrom;
+use std::io::{SeekFrom,BufWriter,Write};
 
 #[test]
 fn argon2i_config() {
@@ -36,7 +36,7 @@ fn argon2i_config() {
 about = concat!(
 "Symmetric, randomized, authenticated encryption/decryption\n\n",
 "Passphrases are read from stdin (until newline or eof).\n",
-"Outputs are written to stdout.\n",
+"Outputs are written to stdout or `outfile`.\n",
 "Algorithms: argon2i (kdf), chacha20 (stream cipher), blake2b (hmac)\n\n",
 "WARNING: if the file is changed while scromble is reading it, bad\n",
 "things could happen!",
@@ -48,6 +48,10 @@ enum Command {
         /// The file to be encrypted and MACd
         #[structopt(parse(from_os_str))]
         file: PathBuf,
+
+        /// The output file (stdout if not provided)
+        #[structopt(parse(from_os_str))]
+        outfile: Option<PathBuf>,
     },
 
     /// Check the MAC and decrypt. Returns a nonzero error if anything
@@ -60,6 +64,10 @@ enum Command {
         /// The file to be checked and decrypted
         #[structopt(parse(from_os_str))]
         file: PathBuf,
+
+        /// The output file (stdout if not provided)
+        #[structopt(parse(from_os_str))]
+        outfile: Option<PathBuf>,
     },
 }
 
@@ -608,14 +616,26 @@ fn read_block(rd: &mut impl std::io::Read) -> BlockRead {
 fn main() -> Result<(),Box<dyn std::error::Error>> {
     let args = Command::from_args();
     let password = Passphrase(rpassword::read_password()?);
+
     let stdout = std::io::stdout();
-    let mut stdout_lock = std::io::BufWriter::with_capacity(64<<10,stdout.lock());
+    let open_outfile = |outfile: Option<PathBuf>| -> Result<Box<dyn Write>,std::io::Error> {
+        let ret: Box<dyn Write> = if let Some(outfile) = outfile {
+            Box::new(BufWriter::with_capacity(64<<10,File::create(outfile)?))
+        } else {
+            Box::new(BufWriter::with_capacity(64<<10,stdout.lock()))
+        };
+        Ok(ret)
+    };
+
     match args {
         Command::Encrypt {
             file,
+            outfile,
         } => {
+            let outfile = open_outfile(outfile)?;
+
             let mut infile = std::io::BufReader::with_capacity(64<<10,File::open(&file)?);
-            let writer = Box::new(&mut stdout_lock);
+            let writer = outfile;
             let mut scrombler = Scrombler::new(password,writer)?;
             let mut last_block = None;
 
@@ -638,9 +658,12 @@ fn main() -> Result<(),Box<dyn std::error::Error>> {
         Command::Decrypt {
             legacy,
             file,
+            outfile,
         } => {
+            let outfile = open_outfile(outfile)?;
+
             let mut infile = std::io::BufReader::new(File::open(&file)?);
-            let writer = Box::new(&mut stdout_lock);
+            let writer = outfile;
 
             let mut descrombler = {
                 let blk1 = match read_block(&mut infile) {
