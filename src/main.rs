@@ -100,7 +100,6 @@ impl Salt {
 }
 
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug)]
 enum ScrombleError {
     BadHmac,
     BadLength,
@@ -121,6 +120,12 @@ impl fmt::Display for ScrombleError {
                 write!(f, "Ciphertext has an invalid length")
             }
         }
+    }
+}
+
+impl fmt::Debug for ScrombleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (&self as &dyn fmt::Display).fmt(f)
     }
 }
 
