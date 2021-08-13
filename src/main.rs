@@ -99,10 +99,10 @@ impl Salt {
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 enum ScrombleError {
     BadHmac,
-    BadInnerHmac,
     BadLength,
 }
 
@@ -116,9 +116,6 @@ impl fmt::Display for ScrombleError {
         match self {
             ScrombleError::BadHmac => {
                 write!(f, "Ciphertext has an invalid HMAC")
-            }
-            ScrombleError::BadInnerHmac => {
-                write!(f, "Plaintext has an invalid HMAC")
             }
             ScrombleError::BadLength => {
                 write!(f, "Ciphertext has an invalid length")
@@ -228,6 +225,7 @@ impl Nonce {
 // Bob still calculates the correct MAC in memory.
 #[derive(Zeroize)]
 #[zeroize(drop)]
+#[allow(clippy::upper_case_acronyms)]
 struct MAC(Block);
 
 #[test]
@@ -237,7 +235,7 @@ fn all_sizes_agree() {
 
 fn derive_key(pw: Passphrase, s: &Salt) -> Result<Key, Box<dyn std::error::Error>> {
     let slice = Zeroizing::new(argon2::hash_raw(
-        &pw.0.as_bytes(),
+        pw.0.as_bytes(),
         &(s.0).0,
         &argon2::Config::default(),
     )?);
@@ -252,7 +250,7 @@ fn derive_cipher_and_mac(
     nonce: &Nonce,
 ) -> Result<(chacha20::XChaCha20, blake2b_simd::State), Box<dyn std::error::Error>> {
     let mut cipher = {
-        let key = derive_key(pw, &salt)?;
+        let key = derive_key(pw, salt)?;
         chacha20::XChaCha20::new(&key.0, &nonce.0)
     };
 
@@ -398,7 +396,7 @@ impl<'a> Scrombler<'a> {
 
         let mac = {
             let mut ret = MAC(Block::zero());
-            let mac = Zeroizing::new(self.mac_state.finalize().as_array().clone());
+            let mac = Zeroizing::new(*self.mac_state.finalize().as_array());
             assert!(mac.len() == (ret.0).0.len());
             (ret.0).0.copy_from_slice(&*mac);
             ret
@@ -426,6 +424,7 @@ struct Descrombler<'a> {
     //
     // yes, it sucks. Still a little better than remembering if [0] is the
     // newest or the oldest
+    #[allow(clippy::type_complexity)]
     prev_blocks: Option<(Ciphertext, Option<(Ciphertext, Option<Ciphertext>)>)>,
     writer: Box<dyn std::io::Write + 'a>,
 }
@@ -548,7 +547,7 @@ impl<'a> DescrombleCheck<'a> {
                 prev_blocks: None,
                 writer,
             },
-            prev_mac_state: mac_state.clone(),
+            prev_mac_state: mac_state,
             prev_block: None,
             num_blocks: 0,
         };
@@ -584,7 +583,7 @@ impl<'a> DescrombleCheck<'a> {
                     self.descromble.cipher.try_seek(curpos)?;
                 }
 
-                if &self.prev_mac_state.finalize() != &prev.0[..] {
+                if self.prev_mac_state.finalize() != prev.0[..] {
                     return Err(ScrombleError::BadHmac.into());
                 }
             }
@@ -610,11 +609,7 @@ fn read_block(rd: &mut impl std::io::Read) -> BlockRead {
         match rd.read(&mut ret.0[bytes_read..]) {
             Ok(0) => {
                 return FinalBlock(
-                    ret.0[..bytes_read]
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .into(),
+                    ret.0[..bytes_read].to_vec().into(),
                 );
             }
             Ok(n) => {
