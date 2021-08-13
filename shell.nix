@@ -7,19 +7,20 @@ let
 in
 let
   pkgs = nixpkgs;
-  channel = "nightly";
-  date = "2021-04-17";
-  targets = [ ];
-  chan = (pkgs.rustChannelOfTargets channel date targets
-         ).override {
-           extensions = [ "clippy-preview" ];
-         };
-  # chan = nixpkgs.latest.rustChannels.stable.rust;
+  # channel = "nightly";
+  # date = "2021-07-01";
+  # targets = [ ];
+  # chan = (pkgs.rustChannelOfTargets channel date targets
+  #        ).override {
+  #          extensions = [ "clippy-preview" "rustfmt-preview" ];
+  #        };
+  chan = nixpkgs.latest.rustChannels.stable.rust;
 in
 with pkgs;
 stdenv.mkDerivation {
   name = "moz_overlay_shell";
   buildInputs = [
+    chan
   ];
 }
 
