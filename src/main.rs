@@ -36,7 +36,7 @@ about = concat!(
 "Symmetric, randomized, authenticated encryption/decryption\n\n",
 "Passphrases are read from stdin (until newline or eof).\n",
 "Outputs are written to stdout (non-windows only) or `outfile`.\n",
-"Algorithms: argon2i (kdf), chacha20 (stream cipher), blake2b (hmac)\n\n",
+"Algorithms: argon2i (kdf), xchacha20 (stream cipher), blake2b (hmac)\n\n",
 "WARNING: if the file is changed while scromble is reading it, bad\n",
 "things could happen!",
 )
