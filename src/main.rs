@@ -50,6 +50,9 @@ enum Command {
 
         /// The output file (stdout if not provided)
         #[structopt(parse(from_os_str))]
+        #[cfg(target_os = "windows")]
+        outfile: PathBuf,
+        #[cfg(not(target_os = "windows"))]
         outfile: Option<PathBuf>,
     },
 
@@ -66,6 +69,9 @@ enum Command {
 
         /// The output file (stdout if not provided)
         #[structopt(parse(from_os_str))]
+        #[cfg(target_os = "windows")]
+        outfile: PathBuf,
+        #[cfg(not(target_os = "windows"))]
         outfile: Option<PathBuf>,
     },
 }
@@ -330,7 +336,7 @@ impl<'a> Scrombler<'a> {
         // Block 2: nonce, then random bytes
         {
             let mut block2 = Block::zero();
-            assert!(block2.0.len() >= nonce.0.len());
+            debug_assert!(block2.0.len() >= nonce.0.len());
             block2.0[..nonce.0.len()].copy_from_slice(&nonce.0);
             ret.cipher
                 .try_apply_keystream(&mut block2.0[nonce.0.len()..])?;
@@ -342,7 +348,7 @@ impl<'a> Scrombler<'a> {
             let curpos = ret.cipher.try_current_pos::<usize>()?;
             let nextpos =
                 chacha20::BLOCK_SIZE * ((curpos + chacha20::BLOCK_SIZE - 1) / chacha20::BLOCK_SIZE);
-            assert!(nextpos >= curpos);
+            debug_assert!(nextpos >= curpos);
             ret.cipher.try_seek(nextpos)?;
         }
 
@@ -350,8 +356,8 @@ impl<'a> Scrombler<'a> {
     }
 
     fn internal_write_block(&mut self, blk: Block) -> Result<(), Box<dyn std::error::Error>> {
-        self.mac_state.update(&blk.0);
         self.writer.write_all(&blk.0)?;
+        self.mac_state.update(&blk.0);
         Ok(())
     }
 
@@ -365,7 +371,7 @@ impl<'a> Scrombler<'a> {
         mut self,
         blk: Zeroizing<Vec<u8>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        assert!(blk.len() <= chacha20::BLOCK_SIZE);
+        debug_assert!(blk.len() <= chacha20::BLOCK_SIZE);
         let num_skipped_bytes = chacha20::BLOCK_SIZE - blk.len();
         // Best to crash if this would fail
         let num_skipped_bytes: u8 = num_skipped_bytes.try_into()?;
@@ -402,7 +408,7 @@ impl<'a> Scrombler<'a> {
         let mac = {
             let mut ret = MAC(Block::zero());
             let mac = Zeroizing::new(*self.mac_state.finalize().as_array());
-            assert!(mac.len() == (ret.0).0.len());
+            debug_assert!(mac.len() == (ret.0).0.len());
             (ret.0).0.copy_from_slice(&*mac);
             ret
         };
@@ -533,7 +539,7 @@ impl<'a> DescrombleCheck<'a> {
             let curpos = cipher.try_current_pos::<usize>()?;
             let nextpos =
                 chacha20::BLOCK_SIZE * ((curpos + chacha20::BLOCK_SIZE - 1) / chacha20::BLOCK_SIZE);
-            assert!(nextpos >= curpos);
+            debug_assert!(nextpos >= curpos);
             cipher.try_seek(nextpos)?;
             cipher
         };
@@ -618,7 +624,7 @@ fn read_block(rd: &mut impl std::io::Read) -> BlockRead {
                 );
             }
             Ok(n) => {
-                assert!(n <= ret.0.len() - bytes_read);
+                debug_assert!(n <= ret.0.len() - bytes_read);
                 bytes_read += n;
             }
             Err(e) => match e.kind() {
@@ -630,7 +636,7 @@ fn read_block(rd: &mut impl std::io::Read) -> BlockRead {
         }
     }
 
-    assert!(bytes_read == ret.0.len());
+    debug_assert!(bytes_read == ret.0.len());
 
     FullBlock(ret.into())
 }
@@ -680,7 +686,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let outfile = open_outfile(outfile)?;
 
-            let mut infile = std::io::BufReader::new(File::open(&file)?);
+            let mut infile = std::io::BufReader::with_capacity(64 << 10, File::open(&file)?);
             let writer = outfile;
 
             let mut descrombler = {

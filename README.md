@@ -25,7 +25,21 @@ issue if that doesn't work!
 If you would like to use the AVX2 backend for XChaCha20, build with
 `nix-shell --command 'RUSTFLAGS="-Ctarget-cpu=haswell
 -Ctarget-feature=+sse2" cargo build --release'` instead. Everything
-else should be the same.
+else should be the same. The fastest results I've seen are expected
+with `RUSTFLAGS="-Ctarget-cpu=native"`.
+
+NOTE FOR WINDOWS USERS
+======================
+
+`scromble` was designed and tested on Linux, so writing the output to
+`stdout` was a perfectly reasonable, sensible idea. However,
+apparently on Windows, writing non-unicode data to `stdout` crashes
+the program, and if you redirect `stdout` to a file causes bytes to be
+interpreted as UTF-8, then converted to UTF-16le with a byte order
+marker and some extra data. I'm working on understanding how on earth
+to deal with that, but for now, please use
+`scromble encrypt <infile> <outfile>`
+and `scromble decrypt <infile> <outfile>`.
 
 Example usage
 =============
@@ -111,7 +125,8 @@ Is this fast?
 On my machine I'm seeing encryption and decryption speeds of
 150-180MB/s (default `sse2` backend) and 200-240MB/s (`avx2` backend)
 when measured through `iotop` -- although, decryption will require
-reading the whole file twice. It can probably be made faster, either
+reading the whole file twice. With `RUSTFLAGS="-Ctarget-cpu=native"`,
+I observed ~300-330MB/s.  It can probably be made faster, either
 through simple optimizations or by multithreading it.
 
 Is this reliable?
