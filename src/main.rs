@@ -646,12 +646,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let password = Passphrase(rpassword::read_password()?);
 
     let stdout = std::io::stdout();
-    let open_outfile = |outfile: Option<PathBuf>| -> Result<Box<dyn Write>, std::io::Error> {
-        let ret: Box<dyn Write> = if let Some(outfile) = outfile {
-            Box::new(BufWriter::with_capacity(64 << 10, File::create(outfile)?))
-        } else {
-            Box::new(BufWriter::with_capacity(64 << 10, stdout.lock()))
-        };
+    let open_outfile = |outfile: _| -> Result<Box<dyn Write>, std::io::Error> {
+        #[cfg(target_os = "windows")]
+        let outfile = Some(outfile);
+
+        let ret: Box<dyn Write> = Box::new(
+            BufWriter::with_capacity(64 << 10,
+                if let Some(outfile) = outfile {
+                    Box::new(File::create(outfile)?) as Box<dyn Write>
+                } else {
+                    Box::new(stdout.lock()) as Box<dyn Write>
+                }));
         Ok(ret)
     };
 
