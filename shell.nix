@@ -12,7 +12,7 @@ let
   targets = [ ];
   chan = (pkgs.rustChannelOfTargets channel date targets
          ).override {
-           extensions = [ "clippy-preview" ];
+           extensions = [ "clippy-preview" "rustfmt-preview" ];
          };
   # chan = nixpkgs.latest.rustChannels.stable.rust;
 in
@@ -20,6 +20,7 @@ with pkgs;
 stdenv.mkDerivation {
   name = "moz_overlay_shell";
   buildInputs = [
+    chan
   ];
 }
 

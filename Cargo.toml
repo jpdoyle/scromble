@@ -22,9 +22,11 @@ rpassword = "5.0"
 rand = "0.7.3"
 generic-array = "0.14.4"
 cipher = { version = "0.3.0", features = [ "std" ] }
+subtle = "2.4.1"
 
 [dev-dependencies]
 num = ""
 quickcheck = ""
+quickcheck_macros = ""
 lazy_static = ""
 
