@@ -1,6 +1,6 @@
 #![deny(warnings)]
 #![allow(clippy::suspicious_op_assign_impl)]
-use core::iter::Product;
+use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 #[cfg(test)]
 use quickcheck::{Arbitrary, Gen};
@@ -20,7 +20,8 @@ fn adc(x: u64, y: u64, c: u64) -> (u64, u64) {
 //
 // Won't overflow because (2^64 - 1)^2 = (2^128 - 1) - 2*(2^64 - 1)
 fn mac(x: u64, y: u64, a: u64, c: u64) -> (u64, u64) {
-    let ret: u128 = ((x as u128) * (y as u128)) + (a as u128) + (c as u128);
+    let ret: u128 =
+        ((x as u128) * (y as u128)) + (a as u128) + (c as u128);
     ((ret & ((1u128 << 64) - 1)) as u64, (ret >> 64) as u64)
 }
 
@@ -162,7 +163,8 @@ impl<'a, 'b> Mul<&'b F512_569> for &'a F512_569 {
             let mut carry = 0;
             for j in 0..8 {
                 let ix = i + j;
-                let (val, next_carry) = mac(self.0[i], rhs.0[j], res[ix], carry);
+                let (val, next_carry) =
+                    mac(self.0[i], rhs.0[j], res[ix], carry);
                 res[ix] = val;
                 carry = next_carry;
             }
@@ -213,6 +215,19 @@ impl<'a, 'b> Mul<&'b F512_569> for &'a F512_569 {
         ]);
         ret.reduce();
 
+        ret
+    }
+}
+
+impl Sum<F512_569> for F512_569 {
+    fn sum<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = F512_569>,
+    {
+        let mut ret = Self::zero();
+        for x in iter {
+            ret += &x;
+        }
         ret
     }
 }
@@ -316,7 +331,10 @@ impl Arbitrary for F512_569 {
     }
 
     fn shrink(&self) -> Box<(dyn Iterator<Item = Self> + 'static)> {
-        let my_vec = self.0.to_vec();
+        let mut my_vec = self.0.to_vec();
+        while my_vec.last() == Some(&0) {
+            my_vec.pop().unwrap();
+        }
         Box::new(my_vec.shrink().map(|v| {
             let mut ret = Self::zero();
             let len = core::cmp::min(v.len(), ret.0.len());
@@ -337,7 +355,8 @@ mod test {
     use std::hash::Hasher;
 
     lazy_static! {
-        static ref P512_569: BigInt = BigInt::from(2).pow(512) - BigInt::from(569);
+        static ref P512_569: BigInt =
+            BigInt::from(2).pow(512) - BigInt::from(569);
     }
 
     // A Pratt certificate for `p` is a proof that there is some value
@@ -431,8 +450,10 @@ mod test {
             let arr2 = <[u8; 64]>::from(&f);
             let f2 = F512_569::from(&arr2);
             assert_eq!(<[u8; 64]>::from(&f2), arr2);
-            let bi_arr = BigInt::from_radix_le(Sign::Plus, &arr, 256).unwrap();
-            let bi_arr2 = BigInt::from_radix_le(Sign::Plus, &arr2, 256).unwrap();
+            let bi_arr =
+                BigInt::from_radix_le(Sign::Plus, &arr, 256).unwrap();
+            let bi_arr2 =
+                BigInt::from_radix_le(Sign::Plus, &arr2, 256).unwrap();
             assert_eq!(bi_arr % P512_569.clone(), bi_arr2);
         }
         {
@@ -483,7 +504,10 @@ mod test {
     }
 
     #[quickcheck]
-    fn stack_eval_test(default_val: F512_569, program: Vec<Result<F512_569, FieldOp>>) {
+    fn stack_eval_test(
+        default_val: F512_569,
+        program: Vec<Result<F512_569, FieldOp>>,
+    ) {
         let field_val = {
             let mut stack = vec![];
             for x in program.iter().cloned() {
@@ -496,45 +520,73 @@ mod test {
                         use FieldOp::*;
                         match op {
                             Neg => {
-                                let val = stack.pop().unwrap_or(default_val.clone());
+                                let val = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push(-&val);
                             }
                             Add => {
-                                let r = stack.pop().unwrap_or(default_val.clone());
-                                let l = stack.pop().unwrap_or(default_val.clone());
+                                let r = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
+                                let l = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push(&l + &r);
                             }
                             Sub => {
-                                let r = stack.pop().unwrap_or(default_val.clone());
-                                let l = stack.pop().unwrap_or(default_val.clone());
+                                let r = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
+                                let l = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push(&l - &r);
                             }
                             Mul => {
-                                let r = stack.pop().unwrap_or(default_val.clone());
-                                let l = stack.pop().unwrap_or(default_val.clone());
+                                let r = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
+                                let l = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push(&l * &r);
                             }
                             Recip => {
-                                let val = stack.pop().unwrap_or(default_val.clone());
+                                let val = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 let recip = val.recip();
                                 stack.push(recip);
 
-                                if bool::from(val.ct_eq(&F512_569::zero())) {
+                                if bool::from(val.ct_eq(&F512_569::zero()))
+                                {
                                     // dbg!(&val);
                                     // dbg!(&recip);
-                                    assert!(bool::from(recip.ct_eq(&F512_569::zero())));
+                                    assert!(bool::from(
+                                        recip.ct_eq(&F512_569::zero())
+                                    ));
                                 } else {
-                                    assert!(bool::from((&val * &recip).ct_eq(&F512_569::one())));
+                                    assert!(bool::from(
+                                        (&val * &recip)
+                                            .ct_eq(&F512_569::one())
+                                    ));
                                 }
                             }
                             Pow => {
-                                let e = stack.pop().unwrap_or(default_val.clone());
-                                let b = stack.pop().unwrap_or(default_val.clone());
+                                let e = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
+                                let b = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push(b.pow_vartime(&e.0));
                             }
 
                             PseudoRandom => {
-                                let val = stack.pop().unwrap_or(default_val.clone());
+                                let val = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 let mut hasher = DefaultHasher::new();
                                 for limb in &val.0 {
                                     // dbg!(&limb);
@@ -545,7 +597,9 @@ mod test {
                                     let chunk = hasher.finish();
                                     hasher.write_u64(0);
                                     for j in 0..8 {
-                                        new_val[8 * i + j] = ((chunk >> (8 * j)) & 0xff) as u8;
+                                        new_val[8 * i + j] =
+                                            ((chunk >> (8 * j)) & 0xff)
+                                                as u8;
                                     }
                                 }
                                 // dbg!(&new_val);
@@ -562,52 +616,81 @@ mod test {
         let bigint_val = {
             let mut stack = vec![];
             let p = P512_569.clone();
-            let default_val = BigInt::from_bytes_le(Sign::Plus, &<[u8; 64]>::from(&default_val));
+            let default_val = BigInt::from_bytes_le(
+                Sign::Plus,
+                &<[u8; 64]>::from(&default_val),
+            );
             for x in program {
                 match x {
                     Ok(val) => {
-                        stack.push(BigInt::from_bytes_le(Sign::Plus, &<[u8; 64]>::from(&val)));
+                        stack.push(BigInt::from_bytes_le(
+                            Sign::Plus,
+                            &<[u8; 64]>::from(&val),
+                        ));
                     }
 
                     Err(op) => {
                         use FieldOp::*;
                         match op {
                             Neg => {
-                                let val = stack.pop().unwrap_or(default_val.clone());
+                                let val = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push((-val).mod_floor(&p));
                             }
                             Add => {
-                                let r = stack.pop().unwrap_or(default_val.clone());
-                                let l = stack.pop().unwrap_or(default_val.clone());
+                                let r = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
+                                let l = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push((l + r).mod_floor(&p));
                             }
                             Sub => {
-                                let r = stack.pop().unwrap_or(default_val.clone());
-                                let l = stack.pop().unwrap_or(default_val.clone());
+                                let r = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
+                                let l = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push((l - r).mod_floor(&p));
                             }
                             Mul => {
-                                let r = stack.pop().unwrap_or(default_val.clone());
-                                let l = stack.pop().unwrap_or(default_val.clone());
+                                let r = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
+                                let l = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push((l * r).mod_floor(&p));
                             }
                             Recip => {
-                                let val = stack.pop().unwrap_or(default_val.clone());
+                                let val = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push(val.modpow(&(&p - 2), &p));
                             }
                             Pow => {
-                                let e = stack.pop().unwrap_or(default_val.clone());
-                                let b = stack.pop().unwrap_or(default_val.clone());
+                                let e = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
+                                let b = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 stack.push(b.modpow(&e, &p));
                             }
 
                             PseudoRandom => {
-                                let val = stack.pop().unwrap_or(default_val.clone());
+                                let val = stack
+                                    .pop()
+                                    .unwrap_or(default_val.clone());
                                 let mut hasher = DefaultHasher::new();
                                 let limbs = {
                                     let mut ret = [0u64; 8];
                                     let u64_digits = val.to_u64_digits().1;
-                                    ret[..u64_digits.len()].copy_from_slice(&u64_digits);
+                                    ret[..u64_digits.len()]
+                                        .copy_from_slice(&u64_digits);
                                     ret
                                 };
                                 for limb in &limbs {
@@ -619,12 +702,18 @@ mod test {
                                     let chunk = hasher.finish();
                                     hasher.write_u64(0);
                                     for j in 0..8 {
-                                        new_val[8 * i + j] = ((chunk >> (8 * j)) & 0xff) as u8;
+                                        new_val[8 * i + j] =
+                                            ((chunk >> (8 * j)) & 0xff)
+                                                as u8;
                                     }
                                 }
                                 // dbg!(&new_val);
                                 stack.push(
-                                    BigInt::from_bytes_le(Sign::Plus, &new_val).mod_floor(&p),
+                                    BigInt::from_bytes_le(
+                                        Sign::Plus,
+                                        &new_val,
+                                    )
+                                    .mod_floor(&p),
                                 );
                             }
                         }
