@@ -22,6 +22,7 @@ extern crate quickcheck_macros;
 extern crate lazy_static;
 
 mod f512_569;
+mod secret_sharing;
 mod util;
 
 #[test]

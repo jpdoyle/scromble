@@ -1,11 +1,15 @@
 #![deny(warnings)]
 #![allow(clippy::suspicious_op_assign_impl)]
+use core::iter::Product;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+#[cfg(test)]
+use quickcheck::{Arbitrary, Gen};
+use rand::{CryptoRng, Rng};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, Default, Zeroize)]
-struct F512_569([u64; 8]);
+pub struct F512_569([u64; 8]);
 
 fn adc(x: u64, y: u64, c: u64) -> (u64, u64) {
     let ret: u128 = (x as u128) + (y as u128) + (c as u128);
@@ -47,9 +51,14 @@ impl F512_569 {
         Self::from_u64(0)
     }
 
-    /// Construct one.
     pub fn one() -> Self {
         Self::from_u64(1)
+    }
+
+    pub fn random<R: Rng + CryptoRng>(prng: &mut R) -> Self {
+        let mut ret = Self(prng.gen());
+        ret.reduce();
+        ret
     }
 
     pub fn from_u64(v: u64) -> Self {
@@ -80,7 +89,7 @@ impl F512_569 {
     }
 
     // variable time in the exponent
-    fn pow_vartime(&self, exponent: &[u64]) -> Self {
+    pub fn pow_vartime(&self, exponent: &[u64]) -> Self {
         let mut pow2 = *self;
         let mut ret = Self::one();
 
@@ -95,7 +104,7 @@ impl F512_569 {
         ret
     }
 
-    fn recip(&self) -> Self {
+    pub fn recip(&self) -> Self {
         // x^-1 == x^((2^512 - 569) - 2)
         //      == x^((2^512 - 1) - 570)
         self.pow_vartime(&[
@@ -208,6 +217,19 @@ impl<'a, 'b> Mul<&'b F512_569> for &'a F512_569 {
     }
 }
 
+impl Product<F512_569> for F512_569 {
+    fn product<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = F512_569>,
+    {
+        let mut ret = Self::one();
+        for x in iter {
+            ret *= &x;
+        }
+        ret
+    }
+}
+
 impl<'b> MulAssign<&'b F512_569> for F512_569 {
     fn mul_assign(&mut self, rhs: &'b F512_569) {
         self.0 = ((self as &F512_569) * rhs).0;
@@ -283,11 +305,34 @@ impl From<&[u8; 64]> for F512_569 {
 }
 
 #[cfg(test)]
+impl Arbitrary for F512_569 {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let mut ret = Self::zero();
+        for limb in ret.0.iter_mut() {
+            *limb = u64::arbitrary(g);
+        }
+        ret.reduce();
+        ret
+    }
+
+    fn shrink(&self) -> Box<(dyn Iterator<Item = Self> + 'static)> {
+        let my_vec = self.0.to_vec();
+        Box::new(my_vec.shrink().map(|v| {
+            let mut ret = Self::zero();
+            let len = core::cmp::min(v.len(), ret.0.len());
+            ret.0[..len].copy_from_slice(&v);
+            ret.reduce();
+            ret
+        }))
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
     use num::Integer;
     use num::{bigint::Sign, BigInt};
-    use quickcheck::{quickcheck, Arbitrary, Gen};
+    use quickcheck::quickcheck;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
 
@@ -438,14 +483,13 @@ mod test {
     }
 
     #[quickcheck]
-    fn stack_eval_test(default_val: u64, program: Vec<Result<u64, FieldOp>>) {
+    fn stack_eval_test(default_val: F512_569, program: Vec<Result<F512_569, FieldOp>>) {
         let field_val = {
-            let default_val = F512_569::from_u64(default_val);
             let mut stack = vec![];
             for x in program.iter().cloned() {
                 match x {
                     Ok(val) => {
-                        stack.push(F512_569::from_u64(val));
+                        stack.push(val);
                     }
 
                     Err(op) => {
@@ -476,8 +520,8 @@ mod test {
                                 stack.push(recip);
 
                                 if bool::from(val.ct_eq(&F512_569::zero())) {
-                                    dbg!(&val);
-                                    dbg!(&recip);
+                                    // dbg!(&val);
+                                    // dbg!(&recip);
                                     assert!(bool::from(recip.ct_eq(&F512_569::zero())));
                                 } else {
                                     assert!(bool::from((&val * &recip).ct_eq(&F512_569::one())));
@@ -493,7 +537,7 @@ mod test {
                                 let val = stack.pop().unwrap_or(default_val.clone());
                                 let mut hasher = DefaultHasher::new();
                                 for limb in &val.0 {
-                                    dbg!(&limb);
+                                    // dbg!(&limb);
                                     hasher.write_u64(*limb);
                                 }
                                 let mut new_val = [0u8; 64];
@@ -504,7 +548,7 @@ mod test {
                                         new_val[8 * i + j] = ((chunk >> (8 * j)) & 0xff) as u8;
                                     }
                                 }
-                                dbg!(&new_val);
+                                // dbg!(&new_val);
                                 stack.push(F512_569::from(&new_val));
                             }
                         }
@@ -518,11 +562,11 @@ mod test {
         let bigint_val = {
             let mut stack = vec![];
             let p = P512_569.clone();
-            let default_val = BigInt::from(default_val);
+            let default_val = BigInt::from_bytes_le(Sign::Plus, &<[u8; 64]>::from(&default_val));
             for x in program {
                 match x {
                     Ok(val) => {
-                        stack.push(BigInt::from(val));
+                        stack.push(BigInt::from_bytes_le(Sign::Plus, &<[u8; 64]>::from(&val)));
                     }
 
                     Err(op) => {
@@ -567,7 +611,7 @@ mod test {
                                     ret
                                 };
                                 for limb in &limbs {
-                                    dbg!(&limb);
+                                    // dbg!(&limb);
                                     hasher.write_u64(*limb);
                                 }
                                 let mut new_val = [0u8; 64];
@@ -578,7 +622,7 @@ mod test {
                                         new_val[8 * i + j] = ((chunk >> (8 * j)) & 0xff) as u8;
                                     }
                                 }
-                                dbg!(&new_val);
+                                // dbg!(&new_val);
                                 stack.push(
                                     BigInt::from_bytes_le(Sign::Plus, &new_val).mod_floor(&p),
                                 );
