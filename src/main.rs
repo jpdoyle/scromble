@@ -619,9 +619,7 @@ fn read_block(rd: &mut impl std::io::Read) -> BlockRead {
     while bytes_read < ret.0.len() {
         match rd.read(&mut ret.0[bytes_read..]) {
             Ok(0) => {
-                return FinalBlock(
-                    ret.0[..bytes_read].to_vec().into(),
-                );
+                return FinalBlock(ret.0[..bytes_read].to_vec().into());
             }
             Ok(n) => {
                 debug_assert!(n <= ret.0.len() - bytes_read);
@@ -650,13 +648,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(target_os = "windows")]
         let outfile = Some(outfile);
 
-        let ret: Box<dyn Write> = Box::new(
-            BufWriter::with_capacity(64 << 10,
-                if let Some(outfile) = outfile {
-                    Box::new(File::create(outfile)?) as Box<dyn Write>
-                } else {
-                    Box::new(stdout.lock()) as Box<dyn Write>
-                }));
+        let ret: Box<dyn Write> = Box::new(BufWriter::with_capacity(
+            64 << 10,
+            if let Some(outfile) = outfile {
+                Box::new(File::create(outfile)?) as Box<dyn Write>
+            } else {
+                Box::new(stdout.lock()) as Box<dyn Write>
+            },
+        ));
         Ok(ret)
     };
 
