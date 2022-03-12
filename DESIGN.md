@@ -209,6 +209,78 @@ Pass 2:
 - Output the first `length(PT)` bytes of `xchacha20(EK,NONCE,CC)`.
 - Finally, check that the file ends with `MB`. If not, exit with an error.
 
+HMAC prefix table
+=================
+
+Once `scromble` has read the file and checked its HMAC, it must read
+through the file a second time in order to actually decrypt the file.
+
+However, this leads to a potential issue: what if the file changes between
+the HMAC check and when scromble reads some particular piece of the file?
+Then, potentially arbitrary data will get through, even though the user
+believes the data has been certified as authentic.
+
+This does not seem like an easily exploitable flaw, but who knows what
+crazy situation someone might be using this tool in? It's better to build a
+tool with rock solid correctness properties than to brush a clear issue
+aside with "that seems too hard to exploit".
+
+`scromble` builds an in-memory data structure during its first pass so that
+every data read on the second pass can be checked for authenticity, at the
+cost of some extra memory usage (at most `sqrt(N)*17` bytes of memory
+usage for an N-byte file).
+
+The HMAC prefix table consists of a block size `block_size` and a sequence
+of "prefix HMACs" `hmac_prefs`. For each `i`, `hmac_prefs[i] ==
+mac2b(HK,data[..(i*block_size)])`. During the HMAC-check pass, the current
+HMAC result will be inserted at the end of `hmac_prefs` every `block_size`
+bytes. During the decryption pass, data is buffered until `block_size`
+bytes have been processed and the HMAC prefix containing those bytes is
+checked.
+
+To minimize the total memory overhead from the HMAC prefix table and the
+buffer required to check against it, `chunk_size` gets updated
+incrementally during the HMAC-check pass. If `hmac_prefs.len()*HMAC_LEN >=
+2*block_size` (here `HMAC_LEN == 64`), then `block_size` gets updated to
+`block_size*2` and every even entry in `hmac_prefs` gets deleted -- ie:
+
+    new_block_size == block_size*2;
+    new_hmac_prefs.len() == hmac_prefs.len()/2;
+    for each i such that 0 <= i and 2*i+1 < hmac_prefs.len():
+        new_hmac_prefs[i] == hmac_prefs[2*i+1];
+
+This scheme approximates the memory-usage optimal HMAC prefix table size,
+which is the solution to `(file_size/block_size)*HMAC_LEN == block_size` --
+ie, `block_size == sqrt(file_size*HMAC_LEN)`. The computational cost
+required to double the block size is `O(1)` amortized (ie, every `2^n`th
+step requires an extra `O(2^n)` work), and the worst-case memory required
+is `block_size + (file_size/block_size)*HMAC_LEN`. The memory usage is
+highest when
+
+    block_size + (file_size/block_size)*HMAC_LEN
+    == 2*block_size + (file_size/(2*block_size))*HMAC_LEN
+
+i.e.,
+
+    block_size*block_size == 32*file_size
+    block_size == 4*sqrt(2)*sqrt(file_size)
+
+    total_mem <= block_size + (file_size/block_size)*HMAC_LEN
+    total_mem <= block_size + 2*block_size
+    total_mem <= 3*4*sqrt(2)*sqrt(file_size)
+    total_mem <= (12*sqrt(2))*sqrt(file_size)
+
+Running some numbers, this means that for this data structure, decrypting
+a:
+
+- 1 mebibyte file requires <=17KiB  of memory
+- 1 gibibyte file requires <=544KiB of memory
+- 1 tebibyte file requires <=16MiB  of memory
+- 1 pebibyte file requires <=544MiB of memory
+- 1 exbibyte file requires <=17GiB  of memory
+
+Which seems like pretty reasonable memory overhead to me.
+
 (In Progress) Secret Shared format
 ==================================
 
