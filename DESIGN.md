@@ -28,6 +28,10 @@ Intended security properties
     - Scromble randomly pads your file (up to 100% for small files, up to
       20% for large files, see [Maximum Pad Scale](#maximum-pad-scale)) but
       can be given a custom random padding range if need be.
+    - When decrypting, scromble doesn't output the padding data, so an
+      adversary can observe how big the file if you let them observe the
+      time or file system traffic totals of decryption. This kind of
+      problem is basically unavoidable without implementing Oblivious RAM.
     - This helps somewhat when you have certain very specific file sizes,
       eg:
         - 41 byte files (git branch files, a 40-byte hex string + a
@@ -280,6 +284,11 @@ a:
 - 1 exbibyte file requires <=17GiB  of memory
 
 Which seems like pretty reasonable memory overhead to me.
+
+NOTE: for speed, `scromble` double-buffers the HMAC prefix table's read
+buffer, so the actual memory usage is more like `4*block_size`, ie,
+`(4/3)*total_mem`. So if you want to decrypt a 1 exbibyte file, you'll need
+to use a computer with ~23GiB of memory.
 
 (In Progress) Secret Shared format
 ==================================
