@@ -45,8 +45,11 @@ The core spec
 Cryptographic RNG
 -----------------
 
-The cryptographic RNG used is rust's `thread_rng`
-(https://docs.rs/rand/latest/rand/fn.thread_rng.html).
+The cryptographic RNG used is `rand_chacha`'s `ChaCha20Rng`, initialized
+via `from_entropy()` (see
+https://rust-random.github.io/rand/rand_chacha/struct.ChaCha20Rng.html and
+https://rust-random.github.io/rand/rand_core/trait.SeedableRng.html#method.from_entropy
+for more information).
 
 Notation
 --------
@@ -55,14 +58,27 @@ Notation
 
 `0^n` denotes the byte sequence consisting of `n` zero bytes.
 
+Argon2 usage
+------------
+
+`Argon2` is used in two modes: `argon2i`, and `argon2id`. `argon2i`
+is configured to use `2^14` blocks (i.e. 16MB) of memory (`M = 1<<14`),
+one pass (`T = 1`), a parallelism factor of 2 (`P = 2`). `argon2id` is
+configured with `M = 1<<13`, `T = 2`, `P = 2`. The output size in both
+cases is 64 bytes.
+
+For rationale, see [Argon2 and the Root Key](#argon2-and-the-root-key).
+
 BLAKE2b usage
 -------------
 
-`mac2b(key,data)` is the result of running BLAKE2b with personalization string
-"sCrOmBlAuThEnTiC", output length 64 bytes, and key `key` on data `data`.
+`mac2b(key,data)` is the result of running BLAKE2b with personalization
+string "sCrOmBlAuThEnTiC", output length 64 bytes, and key `key` on data
+`data`.
 
-`key2b(key,data)` is the result of running BLAKE2b with personalization string
-"sCrOmBlEnCrYpToR", output length 32 bytes, and key `key` on data `data`.
+`key2b(L,key,data)` is the result of running BLAKE2b with personalization
+string "sCrOmBlEnCrYpToR", output length `L` bytes, and key `key` on data
+`data`. In all cases, `L = 32` or `L = 64`.
 
 XChaCha20 usage
 ---------------
@@ -80,7 +96,11 @@ The Salt block `SB` is 64 bytes of data generated from a cryptographic RNG.
 Root key derivation
 -------------------
 
-The root key is derived by `RK := argon2i(password,SB)`
+The root key `RK` is derived by
+
+    RK_i  := argon2i( password,key2b(64,SB,"argon2i"))
+    RK_id := argon2id(password,key2b(64,SB,"argon2id"))
+    RK := key2b(64,0,"root"||RK_i||RK_id)
 
 Nonce block and nonce
 ---------------------
@@ -93,9 +113,9 @@ The first 24 bytes (ie, 192 bits) of `NB` are the nonce `NONCE`
 Subkeys
 -------
 
-The HMAC key is derived by `HK := key2b(RK,"hmac")`
+The HMAC key is derived by `HK := key2b(64,RK,"hmac")`
 
-The encryption key is derived by `EK := key2b(RK,"encrypt")`
+The encryption key is derived by `EK := key2b(32,RK,"encrypt")`
 
 Plaintext
 ---------
@@ -176,8 +196,8 @@ are a few extra principles decryption must follow:
 - Under no circumstance will we do anything with the ciphertext other than
   MAC checking before the MAC has been checked. For some reasonable
   commentary about why this is an important design principle, see [this
-  blog
-  post](https://moxie.org/2011/12/13/the-cryptographic-doom-principle.html).
+  blog post]
+  (https://moxie.org/2011/12/13/the-cryptographic-doom-principle.html).
 - No data inconsistent with the MAC will be output to stdout.
 - No properties of the underlying data will be checked by `scromble`.
 
@@ -290,12 +310,71 @@ buffer, so the actual memory usage is more like `4*block_size`, ie,
 `(4/3)*total_mem`. So if you want to decrypt a 1 exbibyte file, you'll need
 to use a computer with ~23GiB of memory.
 
-(In Progress) Secret Shared format
-==================================
+Argon2 and the Root Key
+=======================
 
-Secret-sharing key derivation
------------------------------
+`scromble`'s usage of `Argon2` is not, to the author's knowledge, in
+compliance with the recommendations of RFC9106
+(https://datatracker.ietf.org/doc/html/rfc9106), but there are several
+contributing reasons for that.
 
-When a file is secret-shared, share `i` has a secret-sharing key
-`SSK_i := argon2i(password,NB)`
+Security considerations
+-----------------------
+
+There are two distinct threats `scromble`'s key derivation is susceptible
+to.
+
+First, an encrypted file may be attacked in an offline fashion by an
+adversary with large amounts of computing resources. This threat is best
+mitigated by using a memory-hard KDF, since it is commonly believed that
+the limiting factor of large-scale compute is memory bandwidth.
+
+For the purposes of memory-hardness, `Argon2d` appears to be far better
+than `Argon2i` -- multiple works have found significant memory-usage
+savings in versions of `Argon2i` (https://eprint.iacr.org/2016/027.pdf,
+https://eprint.iacr.org/2016/759.pdf), while `Argon2d` does not have any
+known such attacks.
+
+Second, an adversary with access to fine-grained timing data might discern
+information about either the password or the derived key.
+
+`Argon2d` accesses memory in a data-dependent way, and thus is potentially
+vulnerable to cache timing side-channel analysis. Such analysis has not
+been reported, but cache timing attacks were also a purely theoretical
+problem for AES for many years before the exploit was demonstrated.
+
+`Argon2id` is a hybrid algorithm, which does data-independent `Argon2i`
+during an initial phase, then switches to `Argon2d`. This prevents timing
+side channel attacks from learning a significant amount about the _input_
+of the KDF, but there is no clear reason to believe that side channel
+analysis cannot reveal the _output_ of the KDF, which is at least as
+important.
+
+In light of that, this recommendation from RFC9106, which was presented
+without any justification, seems patently absurd:
+> If you do not know the difference between the types or you consider
+> side-channel attacks to be a viable threat, choose Argon2id.
+
+To address both offline attacks and side-channel analysis, `scromble` uses
+both `Argon2id` and `Argon2i`, then mixes them to derive the final root
+key. A side-channel analysis will only be able to attack the `Argon2d`
+component of `Argon2id`, and the offline attack will only have a low-memory
+attack against the `Argon2i` portion.
+
+Additionally, RFC9106 recommends 128-bit keys and salts. `scromble` aims
+for a classical security level of 256 bits, so this is not acceptable.
+
+Argon2 parameter choices
+------------------------
+
+In order to maximize the benefits of the `Argon2d` phase of `Argon2id`, a
+minimum value of `T = 2` is used for `Argon2id`. Per RFC9106, a minimum
+value of `T = 1` is used for `Argon2i`. In order to keep `scromble`
+reasonably performant on low-end devices, a maximum value of `P = 2` is
+chosen for both. Since `scromble`'s maximum speed is ~200MB/s, a target
+time of ~0.1s at ~1500MHz was chosen, so key derivation will be less than
+half the time spent for any file above 20MB. Setting `M = 1<<14` for
+`Argon2i` and `M = 1<<13` for `Argon2id` takes roughly 0.092s total at
+1.5GHz on my machine. After turning off throttling (max frequency of
+~4.1GHz), the time with those settings is ~0.033s.
 

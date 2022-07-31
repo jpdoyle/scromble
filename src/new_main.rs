@@ -20,9 +20,8 @@ about = concat!(
 "Symmetric, randomized, authenticated encryption/decryption\n\n",
 "Passphrases are read from stdin (until newline or eof).\n",
 "Outputs are written to stdout (non-windows only) or `outfile`.\n",
-"Algorithms: argon2i (kdf), xchacha20 (stream cipher), blake2b (hmac)\n\n",
-"WARNING: if the file is changed while scromble is reading it, bad\n",
-"things could happen!",
+"Algorithms: argon2 (pbkdf), xchacha20 (stream cipher), blake2b (hmac + kdf)\n",
+"For more information, run `scromble show-design`\n",
 )
 )]
 enum Command {
@@ -43,10 +42,6 @@ enum Command {
     /// Check the MAC and decrypt. Returns a nonzero error if anything
     /// fails.
     Decrypt {
-        /// Decrypt old scrombled files in "legacy" (32-bit cipher stream) mode
-        #[structopt(short, long)]
-        legacy: bool,
-
         /// The file to be checked and decrypted
         #[structopt(parse(from_os_str))]
         file: PathBuf,
@@ -60,15 +55,9 @@ enum Command {
     },
 }
 
-#[allow(clippy::enum_variant_names)]
 enum ScrombleError {
     BadHmac,
-    BadLength,
-}
-
-enum Mode {
-    Legacy,
-    HipAndModern,
+    FileChanged,
 }
 
 impl fmt::Display for ScrombleError {
@@ -77,8 +66,8 @@ impl fmt::Display for ScrombleError {
             ScrombleError::BadHmac => {
                 write!(f, "Ciphertext has an invalid HMAC")
             }
-            ScrombleError::BadLength => {
-                write!(f, "Ciphertext has an invalid length")
+            ScrombleError::FileChanged => {
+                write!(f, "File contents changed while decrypting")
             }
         }
     }

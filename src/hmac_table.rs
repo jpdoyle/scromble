@@ -6,3 +6,7 @@ pub struct HmacTableBuilder {
     position: usize,
 }
 
+pub struct HmacTableChecker {
+
+}
+

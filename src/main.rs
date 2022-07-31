@@ -14,20 +14,28 @@ use std::io::Seek;
 use std::io::{BufWriter, SeekFrom, Write};
 use std::mem;
 
-#[test]
-fn argon2i_config() {
-    use argon2::{Config, ThreadMode, Variant, Version};
+fn argon2i_config() -> argon2::Params {
+    argon2::Params::new(1<<14, 1, 2, Some(64)).unwrap()
+}
 
-    let config = Config::default();
-    assert_eq!(config.ad, &[]);
-    assert_eq!(config.hash_length, 32);
-    assert_eq!(config.lanes, 1);
-    assert_eq!(config.mem_cost, 4096);
-    assert_eq!(config.secret, &[]);
-    assert_eq!(config.thread_mode, ThreadMode::Sequential);
-    assert_eq!(config.time_cost, 3);
-    assert_eq!(config.variant, Variant::Argon2i);
-    assert_eq!(config.version, Version::Version13);
+fn argon2id_config() -> argon2::Params {
+    argon2::Params::new(1<<13, 2, 2, Some(64)).unwrap()
+}
+
+struct Passphrase(SecretString);
+struct Salt([u8;64]);
+
+fn derive_root_key(passphrase: Passphrase, salt: Salt) -> RootKey {
+    let mut buf = BytesMut::with_capacity(2*64);
+    buf.resize(2*64);
+    let a2i = argon2::Argon2::new(argon2::Algorithm::Argon2i,
+        argon2::Version::V0x13, argon2i_config());
+    let a2id = argon2::Argon2::new(argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13, argon2id_config());
+    a2i.hash_password_into(&passphrase.0.expose_secret().as_bytes(), &salt.0, &mut buf[..64]).unwrap();
+    a2id.hash_password_into(&passphrase.0.expose_secret().as_bytes(), &salt.0, &mut buf[64..]).unwrap();
+
+
 }
 
 #[derive(Debug, StructOpt)]
@@ -36,7 +44,7 @@ about = concat!(
 "Symmetric, randomized, authenticated encryption/decryption\n\n",
 "Passphrases are read from stdin (until newline or eof).\n",
 "Outputs are written to stdout (non-windows only) or `outfile`.\n",
-"Algorithms: argon2i (kdf), xchacha20 (stream cipher), blake2b (prf,hmac).\n",
+"Algorithms: argon2i (pbkdf), xchacha20 (stream cipher), blake2b (kdf,hmac).\n",
 "Run with `explain-design` for more details\n\n",
 )
 )]
@@ -63,28 +71,6 @@ enum Command {
     /// Check the MAC and decrypt with the older encryption scheme. Returns
     /// a nonzero error if anything fails.
     Decrypt {
-        /// The file to be checked and decrypted
-        #[structopt(parse(from_os_str))]
-        file: PathBuf,
-
-        /// The output file (stdout if not provided)
-        #[structopt(parse(from_os_str))]
-        #[cfg(target_os = "windows")]
-        outfile: PathBuf,
-        #[cfg(not(target_os = "windows"))]
-        outfile: Option<PathBuf>,
-    },
-
-    /// Check the MAC and decrypt with the older encryption scheme. Returns
-    /// a nonzero error if anything fails.
-    ///
-    /// WARNING: this scheme can output malformed data if the file is
-    /// changed while scromble is reading it, and bad things could happen!
-    OldStyleDecrypt {
-        /// Decrypt old scrombled files in "legacy" (32-bit cipher stream) mode
-        #[structopt(short, long)]
-        legacy: bool,
-
         /// The file to be checked and decrypted
         #[structopt(parse(from_os_str))]
         file: PathBuf,
@@ -127,11 +113,6 @@ impl Block {
     }
 }
 
-#[derive(Zeroize)]
-#[zeroize(drop)]
-struct Passphrase(String);
-
-// 256 bits
 struct Salt(Block);
 
 impl Salt {
@@ -142,15 +123,9 @@ impl Salt {
     }
 }
 
-#[allow(clippy::enum_variant_names)]
 enum ScrombleError {
     BadHmac,
-    BadLength,
-}
-
-enum Mode {
-    Legacy,
-    HipAndModern,
+    FileChanged,
 }
 
 impl fmt::Display for ScrombleError {
@@ -159,8 +134,8 @@ impl fmt::Display for ScrombleError {
             ScrombleError::BadHmac => {
                 write!(f, "Ciphertext has an invalid HMAC")
             }
-            ScrombleError::BadLength => {
-                write!(f, "Ciphertext has an invalid length")
+            ScrombleError::FileChanged => {
+                write!(f, "File contents changed while decrypting")
             }
         }
     }
@@ -354,6 +329,7 @@ fn black_box(input: u8) -> u8 {
 impl<'a> Scrombler<'a> {
     fn new(
         pw: Passphrase,
+        max_pad_factor: Option<f32>,
         writer: Box<dyn std::io::Write + 'a>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let salt = Salt::new_random();
