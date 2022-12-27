@@ -73,11 +73,11 @@ BLAKE2b usage
 -------------
 
 `mac2b(key,data)` is the result of running BLAKE2b with personalization
-string "sCrOmBlAuThEnTiC", output length 64 bytes, and key `key` on data
+string "sCrOmB2AuThEnTiC", output length 64 bytes, and key `key` on data
 `data`.
 
 `key2b(L,key,data)` is the result of running BLAKE2b with personalization
-string "sCrOmBlEnCrYpToR", output length `L` bytes, and key `key` on data
+string "sCrOmB2EnCrYpToR", output length `L` bytes, and key `key` on data
 `data`. In all cases, `L = 32` or `L = 64`.
 
 XChaCha20 usage
@@ -108,7 +108,7 @@ Nonce block and nonce
 The nonce block `NB` is 64 bytes of data generated from a cryptographic
 RNG.
 
-The first 24 bytes (ie, 192 bits) of `NB` are the nonce `NONCE`
+The first 24 bytes (ie, 192 bits) of `NB` are the nonce `NONCE`.
 
 Subkeys
 -------

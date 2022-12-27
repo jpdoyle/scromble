@@ -1,41 +1,485 @@
 #![deny(warnings)]
-#![allow(dead_code)]
+
+use core::cmp::{min,max};
+use secrecy::{Secret,SecretString,ExposeSecret};
 use std::path::PathBuf;
 use structopt::StructOpt;
-use zeroize::{Zeroize, Zeroizing};
-// use chacha20::XChaCha20;
-use chacha20::cipher::{NewCipher, StreamCipher, StreamCipherSeek};
-use rand::thread_rng;
-use rand::RngCore;
-use std::convert::TryInto;
+// use zeroize::Zeroizing;
+use blake2::Blake2bMac;
+use rand_chacha::ChaCha20Rng;
+use cipher::{StreamCipher,StreamCipherSeek};
+use typenum::{IsLessOrEqual,LeEq,consts::{U32,U64},NonZero};
+use rand::{SeedableRng,RngCore};
+// use std::convert::TryInto;
 use std::fmt;
 use std::fs::File;
 use std::io::Seek;
-use std::io::{BufWriter, SeekFrom, Write};
-use std::mem;
+use std::io::Write;
+use std::io::ErrorKind;
+use generic_array::{GenericArray,ArrayLength};
+use subtle::ConstantTimeEq;
+use digest::{FixedOutput,Mac};
+use conv::ApproxFrom;
+use std::convert::TryInto;
 
 fn argon2i_config() -> argon2::Params {
-    argon2::Params::new(1<<14, 1, 2, Some(64)).unwrap()
+    argon2::Params::new(1 << 14, 1, 2, Some(64)).unwrap()
 }
 
 fn argon2id_config() -> argon2::Params {
-    argon2::Params::new(1<<13, 2, 2, Some(64)).unwrap()
+    argon2::Params::new(1 << 13, 2, 2, Some(64)).unwrap()
 }
 
+fn key2b<N>(k: &[u8; 64], data: &[&[u8]]) -> GenericArray<u8, N>
+where
+    N: ArrayLength<u8> + IsLessOrEqual<U64>,
+    LeEq<N, U64>: NonZero,
+{
+    let mut hasher =
+        Blake2bMac::<N>::new_with_salt_and_personal(k, &[], "sCrOmB2EnCrYpToR".as_bytes()).unwrap();
+    for d in data {
+        hasher.update(d);
+    }
+    hasher.finalize_fixed()
+}
+
+// struct RootKey(Zeroizing<Secret<[u8; 64]>>);
+struct RootKey(Secret<[u8; 64]>);
+
 struct Passphrase(SecretString);
-struct Salt([u8;64]);
+#[derive(Clone)]
+struct Nonce(chacha20::XNonce);
+#[derive(Clone)]
+struct NonceBlock(Nonce, [u8; 40]);
+struct Salt([u8; 64]);
 
-fn derive_root_key(passphrase: Passphrase, salt: Salt) -> RootKey {
-    let mut buf = BytesMut::with_capacity(2*64);
-    buf.resize(2*64);
-    let a2i = argon2::Argon2::new(argon2::Algorithm::Argon2i,
-        argon2::Version::V0x13, argon2i_config());
-    let a2id = argon2::Argon2::new(argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13, argon2id_config());
-    a2i.hash_password_into(&passphrase.0.expose_secret().as_bytes(), &salt.0, &mut buf[..64]).unwrap();
-    a2id.hash_password_into(&passphrase.0.expose_secret().as_bytes(), &salt.0, &mut buf[64..]).unwrap();
+// TODO: figure out how to zeroize these and pin them in place.
+//       It isn't obvious that we can even pin all these.
+type HmacState = Box<Blake2bMac<U64>>;
+type CipherState = Box<chacha20::XChaCha20>;
 
+impl RootKey {
+    fn new(pass: Passphrase, salt: &Salt) -> Self {
+        // NOTE: I have no idea how to determine if this
+        // local-to-a-function use of secrets is safe. Without clear
+        // guarantees from LLVM, the compiler or the OS can write these out
+        // to a random spot in memory and never clear it.
 
+        let hash_with_tag = |a2: argon2::Argon2, tag: &'static str| {
+            let mut ret = [0u8; 64];
+            a2.hash_password_into(
+                pass.0.expose_secret().as_bytes(),
+                &key2b::<U64>(&salt.0, &[tag.as_bytes().as_ref()]),
+                &mut ret,
+            )
+            .unwrap();
+            ret
+        };
+
+        let rk_i = {
+            let a2i = argon2::Argon2::new(
+                argon2::Algorithm::Argon2i,
+                argon2::Version::V0x13,
+                argon2i_config(),
+            );
+            hash_with_tag(a2i, "argon2i")
+        };
+
+        let rk_id = {
+            let a2id = argon2::Argon2::new(
+                argon2::Algorithm::Argon2id,
+                argon2::Version::V0x13,
+                argon2id_config(),
+            );
+            hash_with_tag(a2id, "argon2id")
+        };
+
+        Self(Secret::new(key2b::<U64>(
+            &[0u8; 64],
+            &["root".as_bytes(), &rk_i, &rk_id],
+        ).into()))
+    }
+
+    fn create_states(self, nonce: Nonce) -> (CipherState, HmacState) {
+        let hmac_key = key2b::<U64>(self.0.expose_secret(), &["hmac".as_bytes()]);
+        let hmac = Box::new(Blake2bMac::new_with_salt_and_personal(
+            &hmac_key,
+            &[],
+            "sCrOmB2AuThEnTiC".as_bytes(),
+        ).unwrap());
+        let cipher_key = key2b::<U32>(self.0.expose_secret(), &["encrypt".as_bytes()]);
+        let cipher = Box::new(<chacha20::XChaCha20 as cipher::KeyIvInit>::new(
+            &cipher_key,
+            &nonce.0,
+        ));
+        (cipher, hmac)
+    }
+}
+
+fn scromble<R, W>(
+    pw: Passphrase,
+    max_pad_factor: Option<f32>,
+    mut reader: Box<R>,
+    mut writer: Box<W>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: std::io::Write + ?Sized,
+    R: std::io::Read + ?Sized,
+{
+    let mut prng = ChaCha20Rng::from_entropy();
+    let salt = {
+        let mut ret = [0u8; 64];
+        prng.fill_bytes(&mut ret);
+        Salt(ret)
+    };
+    let nonce = {
+        let mut nonce_buf = [0u8; 24];
+        let mut rest_buf = [0u8; 40];
+
+        prng.fill_bytes(&mut nonce_buf);
+        prng.fill_bytes(&mut rest_buf);
+
+        NonceBlock(Nonce(chacha20::XNonce::clone_from_slice(&nonce_buf)), rest_buf)
+    };
+
+    let (mut cipher, mut mac_state) = RootKey::new(pw, &salt).create_states(nonce.0.clone());
+
+    let mut buffer = [0u8; 64 << 10];
+
+    let mut write_data = |buf: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
+        writer.write_all(buf)?;
+        mac_state.update(buf);
+        Ok(())
+    };
+
+    // write SB
+    write_data(&salt.0)?;
+
+    // write NB (beginning of CC)
+    {
+        let nonce_len = (nonce.0).0.len();
+        let nonce_extra_len = nonce.1.len();
+        assert_eq!(nonce_len + nonce_extra_len, 64);
+
+        write_data(&(nonce.0).0)?;
+
+        write_data(&nonce.1)?;
+    }
+
+    let mut bytes_written = 0usize;
+
+    // write the rest of the core ciphertext
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                break;
+            }
+            Ok(bytes_read) => {
+                let ct_buf = &mut buffer[..bytes_read];
+                cipher.try_apply_keystream(ct_buf)?;
+
+                write_data(ct_buf)?;
+                bytes_written = bytes_written
+                    .checked_add(ct_buf.len())
+                    .ok_or(ScrombleError::Overflow)?;
+            }
+            Err(e) => {
+                if ErrorKind::Interrupted != e.kind() {
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
+    // calculate MAXPAD
+    let max_pad: f32 = max_pad_factor.unwrap_or_else(|| {
+        if bytes_written > 65536 {
+            0.2
+        } else if bytes_written <= 2048 {
+            1.0
+        } else {
+            1.0 - 0.8 * ((bytes_written as f32) - 2048f32) / (65536f32 - 2048f32)
+        }
+    });
+
+    let max_pad_length = <u64 as ApproxFrom<f32>>::approx_from(max_pad * max(64, bytes_written) as f32)?;
+
+    assert!(max_pad_length > 0);
+
+    // I'm not worried about the tiny bias here
+    let pad_len = prng.next_u64() % max_pad_length;
+
+    // write out padding
+    let mut remaining_pad = pad_len;
+    while remaining_pad > 0 {
+        let bytes_to_add = min(buffer.len(), remaining_pad as usize);
+
+        let buf = &mut buffer[..bytes_to_add];
+        buf.fill(0);
+        cipher.try_apply_keystream(buf)?;
+        write_data(buf)?;
+        remaining_pad -= buf.len() as u64;
+    }
+
+    // write out length
+    let mut length_bytes = (bytes_written as u64).to_le_bytes();
+    cipher.try_apply_keystream(&mut length_bytes)?;
+    write_data(&length_bytes)?;
+
+    // write out the mac (we're done!)
+    writer.write_all(mac_state.finalize_fixed().as_slice())?;
+
+    writer.flush()?;
+
+    Ok(())
+}
+
+const HMAC_SIZE: usize = 64;
+
+struct HmacTable<R: std::io::Read + std::io::Seek + ?Sized> {
+    bytes_remaining: u64,
+    block_size: u64,
+    hashes_reversed: Vec<digest::Output<Blake2bMac<U64>>>,
+    bytes_in_buffer: u64,
+    inner_buffer: Vec<u8>,
+    hmac: HmacState,
+    reader: Box<R>,
+}
+
+impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
+    fn new(mut hmac: HmacState, mut reader: Box<R>) -> Result<(Self,u64,[u8;8]), Box<dyn std::error::Error>> {
+        let init_hmac = hmac.clone();
+        let mut block_size = 4 << 10;
+        let mut total_bytes_read = 0u64;
+
+        let mut buf = vec![0; block_size + HMAC_SIZE];
+        let mut bytes_in_buf = 0;
+        let mut last_8_bytes = [0u8;8];
+
+        let mut prefix_hashes = vec![];
+
+        loop {
+            match reader.read(&mut buf[bytes_in_buf..]) {
+                Ok(0) => {
+                    break;
+                }
+                Ok(bytes_read) => {
+                    bytes_in_buf += bytes_read;
+                    total_bytes_read += bytes_read as u64;
+                    if bytes_in_buf == buf.len() {
+                        hmac.update(&buf[..block_size]);
+                        prefix_hashes.push(hmac.clone().finalize_fixed());
+
+                        last_8_bytes.copy_from_slice(&buf[block_size-8..block_size]);
+                        let hmac_part: [u8; HMAC_SIZE] = (&buf[block_size..]).try_into().unwrap();
+                        bytes_in_buf = hmac_part.len();
+                        buf[..bytes_in_buf].copy_from_slice(&hmac_part);
+
+                        if prefix_hashes.len() % 2 == 0
+                            && prefix_hashes.len() / 2 >= block_size / HMAC_SIZE
+                        {
+                            block_size *= 2; // TODO: checked
+                            for i in 0..prefix_hashes.len() / 2 {
+                                prefix_hashes[i] = prefix_hashes[2 * i + 1];
+                            }
+                            prefix_hashes.resize(prefix_hashes.len() / 2, Default::default());
+                            buf.resize(block_size + HMAC_SIZE, 0);
+                        }
+                    }
+                }
+                Err(e) => {
+                    if ErrorKind::Interrupted != e.kind() {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        if total_bytes_read < 64 + 24 + 40 + 8 + 64 {
+            return Err(ScrombleError::TooShort.into());
+        }
+
+        assert!(bytes_in_buf >= HMAC_SIZE);
+
+        hmac.update(&buf[..(bytes_in_buf - HMAC_SIZE)]);
+
+        if bytes_in_buf >= HMAC_SIZE {
+            let l8b_included = min(8,bytes_in_buf-HMAC_SIZE);
+            let buf_end = bytes_in_buf-HMAC_SIZE;
+
+            last_8_bytes[8-l8b_included..].copy_from_slice(&buf[buf_end-l8b_included..buf_end]);
+        }
+
+        let final_mac = hmac.finalize_fixed();
+
+        if !<bool>::from(final_mac.as_slice()
+            .ct_eq(&buf[bytes_in_buf - HMAC_SIZE..bytes_in_buf]))
+        {
+            return Err(ScrombleError::BadHmac.into());
+        }
+
+        prefix_hashes.push(final_mac);
+
+        prefix_hashes.reverse();
+
+        reader.rewind()?;
+
+        Ok((Self {
+            bytes_remaining: total_bytes_read,
+            block_size: block_size.try_into().unwrap(),
+            hashes_reversed: prefix_hashes,
+            inner_buffer: vec![0u8; block_size + HMAC_SIZE],
+            hmac: init_hmac,
+            reader,
+            bytes_in_buffer: 0,
+        },total_bytes_read,last_8_bytes))
+    }
+
+    fn next(&mut self, mut buffer: Vec<u8>) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        if self.bytes_remaining == 0 {
+            return Ok(None);
+        }
+
+        buffer.resize(self.block_size as usize + HMAC_SIZE, 0);
+        let mut buffer = core::mem::replace(&mut self.inner_buffer, buffer);
+        assert_eq!(buffer.len(), self.block_size as usize + HMAC_SIZE);
+
+        loop {
+            match self.reader.read(&mut buffer[self.bytes_in_buffer as usize..]) {
+                Ok(0) => {
+                    break;
+                }
+                Ok(bytes_read) => {
+                    self.bytes_in_buffer += bytes_read as u64;
+                    self.bytes_remaining = self
+                        .bytes_remaining
+                        .checked_sub(bytes_read as u64)
+                        .ok_or(ScrombleError::FileChanged)?;
+
+                    if self.bytes_in_buffer == buffer.len() as u64 {
+                        self.hmac.update(&buffer[..self.block_size as usize]);
+
+                        let hmac_part: [u8; HMAC_SIZE] =
+                            (&buffer[self.block_size as usize..]).try_into().unwrap();
+
+                        let segment_hash: [u8; HMAC_SIZE] = self.hmac.clone().finalize_fixed().into();
+                        let expected_hash =
+                            self.hashes_reversed.pop().ok_or(ScrombleError::FileChanged)?;
+                        if !bool::from(segment_hash.as_slice().ct_eq(&expected_hash))
+                        {
+                            return Err(ScrombleError::FileChanged.into());
+                        }
+
+                        self.inner_buffer[..HMAC_SIZE].copy_from_slice(&hmac_part);
+                        self.bytes_in_buffer = HMAC_SIZE as u64;
+
+                        buffer.resize(self.block_size as usize, 0);
+
+                        return Ok(Some(buffer));
+                    }
+                }
+                Err(e) => {
+                    if ErrorKind::Interrupted != e.kind() {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        if self.bytes_remaining > 0 || self.hashes_reversed.len() != 1 {
+            return Err(ScrombleError::FileChanged.into());
+        }
+
+        assert!(self.bytes_in_buffer >= HMAC_SIZE as u64);
+        self.hmac.update(&buffer[..self.bytes_in_buffer as usize - HMAC_SIZE]);
+
+        let final_mac = self.hmac.clone().finalize_fixed();
+        // can be an unwrap()
+        let final_hash = self
+            .hashes_reversed
+            .pop()
+            .ok_or(ScrombleError::FileChanged)?;
+
+        if !<bool>::from(final_mac.as_slice().ct_eq(final_hash.as_slice())) {
+            return Err(ScrombleError::FileChanged.into());
+        }
+
+        if !<bool>::from(final_mac.as_slice()
+            .ct_eq(&buffer[self.bytes_in_buffer as usize - HMAC_SIZE..self.bytes_in_buffer as usize]))
+        {
+            return Err(ScrombleError::FileChanged.into());
+        }
+
+        buffer.resize(self.bytes_in_buffer as usize - HMAC_SIZE,0);
+        Ok(Some(buffer))
+    }
+}
+
+fn descromble<R, W>(
+    pw: Passphrase,
+    mut reader: Box<R>,
+    mut writer: Box<W>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: std::io::Write + ?Sized,
+    R: std::io::Read + std::io::Seek + ?Sized,
+{
+    let salt = {
+        let mut ret = [0u8; 64];
+
+        reader.read_exact(&mut ret)?;
+        Salt(ret)
+    };
+
+    let nonce = {
+        let mut ret = [0u8; 24];
+
+        reader.read_exact(&mut ret)?;
+        Nonce(ret.into())
+    };
+
+    let (cipher, mac_state) = RootKey::new(pw, &salt).create_states(nonce.clone());
+
+    reader.rewind()?;
+
+    let (mut mac_table,total_size,mut last_8) = HmacTable::new(mac_state, reader)?;
+    let mut cipher = cipher;
+
+    let mut buf = vec![];
+    let mut is_first = true;
+    let mut correct_size = 0;
+    let mut bytes_written = 0;
+    while let Some(block) = mac_table.next(core::mem::take(&mut buf))? {
+        buf = block;
+
+        let output_slice: &mut [u8] = if is_first {
+            is_first = false;
+            if &buf[..64] != &salt.0 || &buf[64..88] != nonce.0.as_slice() {
+                return Err(ScrombleError::FileChanged.into());
+            }
+
+            {
+                cipher.try_seek(total_size-128-64-8)?;
+                cipher.apply_keystream(&mut last_8);
+                correct_size = u64::from_le_bytes(last_8);
+                assert!(correct_size <= total_size-128-64-8);
+                cipher.try_seek(0)?;
+            }
+
+            &mut buf[128..]
+        } else {
+            &mut buf
+        };
+
+        let amount_to_write = min(output_slice.len(),correct_size as usize-bytes_written);
+        cipher.try_apply_keystream(&mut output_slice[..amount_to_write])?;
+        writer.write_all(&output_slice[..amount_to_write])?;
+        bytes_written += amount_to_write;
+    }
+
+    writer.flush()?;
+
+    Ok(())
 }
 
 #[derive(Debug, StructOpt)]
@@ -44,10 +488,11 @@ about = concat!(
 "Symmetric, randomized, authenticated encryption/decryption\n\n",
 "Passphrases are read from stdin (until newline or eof).\n",
 "Outputs are written to stdout (non-windows only) or `outfile`.\n",
-"Algorithms: argon2i (pbkdf), xchacha20 (stream cipher), blake2b (kdf,hmac).\n",
+"Algorithms: argon2 (pbkdf), xchacha20 (stream cipher), blake2b (kdf,hmac).\n",
 "Run with `explain-design` for more details\n\n",
 )
 )]
+#[allow(dead_code)]
 enum Command {
     /// Encrypt and MAC with fresh randomness.
     Encrypt {
@@ -90,7 +535,6 @@ enum Command {
     GenCompletion {
         /// Which shell to generate completions for (leave empty to list
         /// the available options)
-        #[structopt(parse(from_os_str))]
         which_shell: Option<String>,
 
         /// Where to put the completions
@@ -99,43 +543,27 @@ enum Command {
     },
 }
 
-#[derive(Zeroize, Clone)]
-struct Block([u8; chacha20::BLOCK_SIZE]);
-
-impl Block {
-    fn new_random() -> Self {
-        let mut ret = Self::zero();
-        thread_rng().fill_bytes(&mut ret.0);
-        ret
-    }
-    fn zero() -> Self {
-        Self([0u8; chacha20::BLOCK_SIZE])
-    }
-}
-
-struct Salt(Block);
-
-impl Salt {
-    fn new_random() -> Self {
-        let mut ret = Salt(Block::zero());
-        thread_rng().fill_bytes(&mut (ret.0).0);
-        ret
-    }
-}
-
 enum ScrombleError {
+    TooShort,
     BadHmac,
     FileChanged,
+    Overflow,
 }
 
 impl fmt::Display for ScrombleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ScrombleError::TooShort => {
+                write!(f, "File is too short to be a valid scromble file")
+            }
             ScrombleError::BadHmac => {
                 write!(f, "Ciphertext has an invalid HMAC")
             }
             ScrombleError::FileChanged => {
                 write!(f, "File contents changed while decrypting")
+            }
+            ScrombleError::Overflow => {
+                write!(f, "An integer overflow occurred")
             }
         }
     }
@@ -149,646 +577,48 @@ impl fmt::Debug for ScrombleError {
 
 impl std::error::Error for ScrombleError {}
 
-#[derive(Zeroize)]
-#[zeroize(drop)]
-struct Key(chacha20::Key);
-
-#[derive(Zeroize)]
-#[zeroize(drop)]
-struct Plaintext(Block);
-
-const BLOCKS_PER_STEP: u64 = core::u32::MAX as u64 / 2;
-
-// NOTE: this is only necessary in "legacy" mode now that XChaCha20
-// properly supports the full 64-bit keystream
-fn refresh_cipher(cipher: &mut chacha20::XChaCha20) -> Result<(), Box<dyn std::error::Error>> {
-    let mut new_key = Key(Default::default());
-    let mut new_nonce = Nonce(Default::default());
-    cipher.try_apply_keystream(&mut new_key.0)?;
-    cipher.try_apply_keystream(&mut new_nonce.0)?;
-    *cipher = chacha20::XChaCha20::new(&new_key.0, &new_nonce.0);
-    Ok(())
-}
-
-impl Plaintext {
-    fn encrypt(
-        mut self,
-        cipher: &mut chacha20::XChaCha20,
-        mut blocks_avail: Option<&mut u64>,
-    ) -> Result<Ciphertext, Box<dyn std::error::Error>> {
-        let mut blk = mem::replace(&mut self.0, Block::zero());
-        if let Some(ref mut blocks_avail) = blocks_avail {
-            if **blocks_avail == 0 {
-                refresh_cipher(cipher)?;
-                **blocks_avail = BLOCKS_PER_STEP;
-            }
-        }
-
-        // cipher.apply_keystream(&mut blk.0);
-        cipher.try_apply_keystream(&mut blk.0)?;
-        if let Some(blocks_avail) = blocks_avail {
-            *blocks_avail -= 1;
-        }
-
-        Ok(Ciphertext(blk))
-    }
-}
-
-#[derive(Clone)]
-struct Ciphertext(Block);
-
-impl Ciphertext {
-    fn decrypt(
-        self,
-        cipher: &mut chacha20::XChaCha20,
-        mut blocks_avail: Option<&mut u64>,
-    ) -> Result<Plaintext, Box<dyn std::error::Error>> {
-        let mut blk = self.0;
-        if let Some(ref mut blocks_avail) = blocks_avail {
-            if **blocks_avail == 0 {
-                refresh_cipher(cipher)?;
-                **blocks_avail = BLOCKS_PER_STEP;
-            }
-        }
-
-        // cipher.apply_keystream(&mut blk.0);
-        cipher.try_apply_keystream(&mut blk.0)?;
-        if let Some(blocks_avail) = blocks_avail {
-            *blocks_avail -= 1;
-        }
-        Ok(Plaintext(blk))
-    }
-}
-
-// the blake2b module doesn't have a way to zeroize it, so we fill it with
-// some junk instead
-fn blake2b_finalize(mut mac_state: blake2b_simd::State) {
-    let mut random_extra = [0u8; 64];
-    rand::thread_rng().fill_bytes(&mut random_extra);
-    mac_state.update(&random_extra);
-    // hopefully this is enough to keep the compiler from noticing
-    // it can elide those writes
-    for b in mac_state.finalize().as_array().iter() {
-        black_box(*b);
-    }
-}
-
-struct Nonce(chacha20::XNonce);
-
-impl Nonce {
-    fn new_random() -> Self {
-        let mut ret = Self(Default::default());
-        thread_rng().fill_bytes(&mut ret.0);
-        ret
-    }
-}
-
-// Needs to be zeroize-on-drop for chosen-ciphertext reasons. If Alice can
-// convince Bob to try decrypting a message from her with an incorrect MAC,
-// Bob still calculates the correct MAC in memory.
-#[derive(Zeroize)]
-#[zeroize(drop)]
-#[allow(clippy::upper_case_acronyms)]
-struct MAC(Block);
-
 #[test]
 fn all_sizes_agree() {
     assert_eq!(blake2b_simd::OUTBYTES, chacha20::BLOCK_SIZE);
 }
 
-fn derive_key(pw: Passphrase, s: &Salt) -> Result<Key, Box<dyn std::error::Error>> {
-    let slice = Zeroizing::new(argon2::hash_raw(
-        pw.0.as_bytes(),
-        &(s.0).0,
-        &argon2::Config::default(),
-    )?);
-    Ok(Key(generic_array::GenericArray::<_, _>::clone_from_slice(
-        slice.as_slice(),
-    )))
-}
-
-fn derive_cipher_and_mac(
-    pw: Passphrase,
-    salt: &Salt,
-    nonce: &Nonce,
-) -> Result<(chacha20::XChaCha20, blake2b_simd::State), Box<dyn std::error::Error>> {
-    let mut cipher = {
-        let key = derive_key(pw, salt)?;
-        chacha20::XChaCha20::new(&key.0, &nonce.0)
-    };
-
-    let mac_key = {
-        let mut ret = Key(Default::default());
-        cipher.try_apply_keystream(&mut ret.0)?;
-        ret
-    };
-
-    let mac_state = blake2b_simd::Params::new()
-        .hash_length(blake2b_simd::OUTBYTES)
-        .personal(b"sCrOmBlEnCrYpToR")
-        .key(&mac_key.0)
-        .to_state();
-
-    Ok((cipher, mac_state))
-}
-
-struct Scrombler<'a> {
-    cipher: chacha20::XChaCha20,
-    mac_state: blake2b_simd::State,
-    writer: Box<dyn std::io::Write + 'a>,
-}
-
-/// From https://docs.rs/subtle/2.3.0/src/subtle/lib.rs.html#138
-/// This function is a best-effort attempt to prevent the compiler from
-/// knowing anything about the value of the returned `u8`, other than its
-/// type.
-///
-/// Because we want to support stable Rust, we don't have access to inline
-/// assembly or test::black_box, so we use the fact that volatile values
-/// will never be elided to register values.
-///
-/// Note: Rust's notion of "volatile" is subject to change over time. While
-/// this code may break in a non-destructive way in the future,
-/// “constant-time” code is a continually moving target, and this is better
-/// than doing nothing.
-#[inline(never)]
-fn black_box(input: u8) -> u8 {
-    unsafe {
-        // Optimization barrier
-        //
-        // Unsafe is ok, because:
-        //   - &input is not NULL;
-        //   - size of input is not zero;
-        //   - u8 is neither Sync, nor Send;
-        //   - u8 is Copy, so input is always live;
-        //   - u8 type is always properly aligned.
-        core::ptr::read_volatile(&input as *const u8)
-    }
-}
-
-impl<'a> Scrombler<'a> {
-    fn new(
-        pw: Passphrase,
-        max_pad_factor: Option<f32>,
-        writer: Box<dyn std::io::Write + 'a>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let salt = Salt::new_random();
-        let nonce = Nonce::new_random();
-
-        let (cipher, mac_state) = derive_cipher_and_mac(pw, &salt, &nonce)?;
-
-        let mut ret = Self {
-            cipher,
-            mac_state,
-            writer,
-        };
-
-        // Block 1: salt
-        ret.internal_write_block(salt.0)?;
-
-        // Block 2: nonce, then random bytes
-        {
-            let mut block2 = Block::zero();
-            debug_assert!(block2.0.len() >= nonce.0.len());
-            block2.0[..nonce.0.len()].copy_from_slice(&nonce.0);
-            ret.cipher
-                .try_apply_keystream(&mut block2.0[nonce.0.len()..])?;
-            ret.internal_write_block(block2)?;
-        }
-
-        // run the cipher forward until a round number
-        {
-            let curpos = ret.cipher.try_current_pos::<usize>()?;
-            let nextpos =
-                chacha20::BLOCK_SIZE * ((curpos + chacha20::BLOCK_SIZE - 1) / chacha20::BLOCK_SIZE);
-            debug_assert!(nextpos >= curpos);
-            ret.cipher.try_seek(nextpos)?;
-        }
-
-        Ok(ret)
-    }
-
-    fn internal_write_block(&mut self, blk: Block) -> Result<(), Box<dyn std::error::Error>> {
-        self.writer.write_all(&blk.0)?;
-        self.mac_state.update(&blk.0);
-        Ok(())
-    }
-
-    fn encrypt_block(&mut self, blk: Plaintext) -> Result<(), Box<dyn std::error::Error>> {
-        let ciphertext = blk.encrypt(&mut self.cipher, None)?;
-        self.internal_write_block(ciphertext.0)?;
-        Ok(())
-    }
-
-    fn encrypt_last_bytes(
-        mut self,
-        blk: Zeroizing<Vec<u8>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        debug_assert!(blk.len() <= chacha20::BLOCK_SIZE);
-        let num_skipped_bytes = chacha20::BLOCK_SIZE - blk.len();
-        // Best to crash if this would fail
-        let num_skipped_bytes: u8 = num_skipped_bytes.try_into()?;
-
-        // 2nd-to-last block: the last bytes + zero padding
-        //
-        // NOTE: we do not (and SHOULD NOT) validate the zero padding on
-        // decrypt. For our purposes, the zero padding may as well be
-        // random data, but with a stream cipher it doesn't matter much.
-        //
-        // Data validity ONLY comes from the MAC. Anything else is asking
-        // for trouble.
-        let blk1 = {
-            let mut ret = Plaintext(Block::zero());
-            (ret.0).0[..blk.len()].copy_from_slice(&blk);
-            ret
-        };
-        self.encrypt_block(blk1)?;
-
-        let blk2 = {
-            let mut ret = Plaintext(Block::zero());
-            (ret.0).0[0] = num_skipped_bytes;
-            ret
-        };
-        self.encrypt_block(blk2)?;
-
-        // TODO
-        // self.cipher.zeroize();
-
-        // hip-and-modern inclusion of one-block-after keystream
-        self.mac_state
-            .update(&(Plaintext(Block::zero()).encrypt(&mut self.cipher, None)?.0).0);
-
-        let mac = {
-            let mut ret = MAC(Block::zero());
-            let mac = Zeroizing::new(*self.mac_state.finalize().as_array());
-            debug_assert!(mac.len() == (ret.0).0.len());
-            (ret.0).0.copy_from_slice(&*mac);
-            ret
-        };
-
-        // TODO: is this necessary when encrypting?
-        blake2b_finalize(self.mac_state);
-
-        self.writer.write_all(&(mac.0).0)?;
-        self.writer.flush()?;
-
-        Ok(())
-    }
-}
-
-struct Descrombler<'a> {
-    // cipher is stepped to prev_prev_block (if some)
-    cipher: chacha20::XChaCha20,
-    blocks_avail: Option<u64>,
-    // Keep the prev of each so that you can compare the final hash to the
-    // final block
-    prev_mac_state: blake2b_simd::State,
-    // keep prev 3 since second-to-last has the number of skipped bytes in
-    // third-to-last
-    //
-    // yes, it sucks. Still a little better than remembering if [0] is the
-    // newest or the oldest
-    #[allow(clippy::type_complexity)]
-    prev_blocks: Option<(Ciphertext, Option<(Ciphertext, Option<Ciphertext>)>)>,
-    writer: Box<dyn std::io::Write + 'a>,
-}
-
-impl<'a> Descrombler<'a> {
-    fn add_block(&mut self, blk: Block) -> Result<(), Box<dyn std::error::Error>> {
-        let blk = Ciphertext(blk);
-        match self.prev_blocks.as_mut() {
-            None => {
-                self.prev_blocks = Some((blk, None));
-            }
-            Some((prev, rest)) => {
-                self.prev_mac_state.update(&(prev.0).0);
-                match rest.as_mut() {
-                    None => {
-                        *rest = Some((prev.clone(), None));
-                    }
-                    Some((prevprev, rest)) => {
-                        if let Some(prevprevprev) = rest.as_mut() {
-                            self.writer.write_all(
-                                &(prevprevprev
-                                    .clone()
-                                    .decrypt(&mut self.cipher, self.blocks_avail.as_mut())?
-                                    .0)
-                                    .0,
-                            )?
-                        }
-                        *rest = Some(prevprev.clone());
-
-                        *prevprev = prev.clone()
-                    }
-                }
-                *prev = blk
-            }
-        }
-        Ok(())
-    }
-
-    fn finalize(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some((mac_block, Some((skip_block, Some(last_data_block))))) = self.prev_blocks {
-            let last_data_block =
-                last_data_block.decrypt(&mut self.cipher, self.blocks_avail.as_mut())?;
-            let skip_block = skip_block.decrypt(&mut self.cipher, self.blocks_avail.as_mut())?;
-
-            if self.blocks_avail.is_none() {
-                // hip-and-modern inclusion of one-block-after keystream
-                self.prev_mac_state
-                    .update(&(Plaintext(Block::zero()).encrypt(&mut self.cipher, None)?.0).0);
-            }
-
-            if self.prev_mac_state.finalize() != (mac_block.0).0[..] {
-                return Err(ScrombleError::BadHmac.into());
-            }
-            blake2b_finalize(self.prev_mac_state);
-
-            // TODO
-            // self.cipher.zeroize();
-            // skipping 0 and skipping BLOCK_SIZE are both "reasonable"
-            let num_skipped = ((skip_block.0).0[0] as usize) % ((last_data_block.0).0.len() + 1);
-            let num_not_skipped = (last_data_block.0).0.len() - num_skipped;
-            self.writer
-                .write_all(&(last_data_block.0).0[..num_not_skipped])?;
-            self.writer.flush()?;
-            Ok(())
-        } else {
-            Err(ScrombleError::BadLength.into())
-        }
-    }
-}
-
-// this checks the mac
-struct DescrombleCheck<'a> {
-    descromble: Descrombler<'a>,
-    prev_mac_state: blake2b_simd::State,
-    prev_block: Option<Block>,
-    num_blocks: u64,
-}
-
-impl<'a> DescrombleCheck<'a> {
-    fn new(
-        pw: Passphrase,
-        writer: Box<dyn std::io::Write + 'a>,
-        blk1: Block,
-        blk2: Block,
-        mode: Mode,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let salt = Salt(blk1.clone());
-        let nonce = {
-            let mut ret = Nonce(Default::default());
-            let retlen = ret.0.len();
-            ret.0.copy_from_slice(&blk2.0[..retlen]);
-            ret
-        };
-
-        let (mut cipher, mut mac_state) = derive_cipher_and_mac(pw, &salt, &nonce)?;
-
-        // run the cipher forward to match scrombling
-        let cipher = {
-            let curpos = cipher.try_current_pos::<usize>()?;
-            cipher.try_seek(curpos + (blk2.0.len() - nonce.0.len()))?;
-            let curpos = cipher.try_current_pos::<usize>()?;
-            let nextpos =
-                chacha20::BLOCK_SIZE * ((curpos + chacha20::BLOCK_SIZE - 1) / chacha20::BLOCK_SIZE);
-            debug_assert!(nextpos >= curpos);
-            cipher.try_seek(nextpos)?;
-            cipher
-        };
-        mac_state.update(&blk1.0);
-        mac_state.update(&blk2.0);
-        let mac_state = mac_state;
-
-        let ret = DescrombleCheck {
-            descromble: Descrombler {
-                cipher,
-                prev_mac_state: mac_state.clone(),
-                blocks_avail: match mode {
-                    Mode::Legacy => Some(BLOCKS_PER_STEP),
-                    Mode::HipAndModern => None,
-                },
-                prev_blocks: None,
-                writer,
-            },
-            prev_mac_state: mac_state,
-            prev_block: None,
-            num_blocks: 0,
-        };
-        Ok(ret)
-    }
-
-    fn add_block(&mut self, blk: Block) {
-        if let Some(prev) = self.prev_block.as_ref() {
-            self.num_blocks += 1;
-            self.prev_mac_state.update(&prev.0);
-        }
-        self.prev_block = Some(blk);
-    }
-
-    fn finalize(mut self) -> Result<Descrombler<'a>, Box<dyn std::error::Error>> {
-        match self.prev_block.as_ref() {
-            None => {
-                return Err(ScrombleError::BadLength.into());
-            }
-            Some(prev) => {
-                if self.descromble.blocks_avail.is_none() {
-                    let curpos: u128 = self.descromble.cipher.try_current_pos()?;
-                    self.descromble.cipher.try_seek(
-                        curpos + (self.num_blocks as u128) * (chacha20::BLOCK_SIZE as u128),
-                    )?;
-                    // hip-and-modern inclusion of one-block-after keystream
-                    self.prev_mac_state.update(
-                        &(Plaintext(Block::zero())
-                            .encrypt(&mut self.descromble.cipher, None)?
-                            .0)
-                            .0,
-                    );
-                    self.descromble.cipher.try_seek(curpos)?;
-                }
-
-                if self.prev_mac_state.finalize() != prev.0[..] {
-                    return Err(ScrombleError::BadHmac.into());
-                }
-            }
-        }
-
-        blake2b_finalize(self.prev_mac_state);
-
-        Ok(self.descromble)
-    }
-}
-
-enum BlockRead {
-    ReadErr(std::io::Error),
-    FullBlock(Zeroizing<Block>),
-    FinalBlock(Zeroizing<Vec<u8>>),
-}
-
-fn read_block(rd: &mut impl std::io::Read) -> BlockRead {
-    use BlockRead::*;
-    let mut ret = Block::zero();
-    let mut bytes_read = 0;
-    while bytes_read < ret.0.len() {
-        match rd.read(&mut ret.0[bytes_read..]) {
-            Ok(0) => {
-                return FinalBlock(ret.0[..bytes_read].to_vec().into());
-            }
-            Ok(n) => {
-                debug_assert!(n <= ret.0.len() - bytes_read);
-                bytes_read += n;
-            }
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::Interrupted => {} // retry
-                _ => {
-                    return ReadErr(e);
-                }
-            },
-        }
-    }
-
-    debug_assert!(bytes_read == ret.0.len());
-
-    FullBlock(ret.into())
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Command::from_args();
-    let password = Passphrase(rpassword::read_password()?);
+    let password = Passphrase(rpassword::read_password()?.into());
 
     let stdout = std::io::stdout();
     let open_outfile = |outfile: _| -> Result<Box<dyn Write>, std::io::Error> {
         #[cfg(target_os = "windows")]
         let outfile = Some(outfile);
 
-        let ret: Box<dyn Write> = Box::new(BufWriter::with_capacity(
-            64 << 10,
-            if let Some(outfile) = outfile {
-                Box::new(File::create(outfile)?) as Box<dyn Write>
-            } else {
-                Box::new(stdout.lock()) as Box<dyn Write>
-            },
-        ));
+        let ret: Box<dyn Write> = if let Some(outfile) = outfile {
+            Box::new(File::create(outfile)?) as Box<dyn Write>
+        } else {
+            Box::new(stdout.lock()) as Box<dyn Write>
+        };
         Ok(ret)
     };
 
     match args {
-        Command::Encrypt { file, outfile } => {
-            let outfile = open_outfile(outfile)?;
-
-            let mut infile = std::io::BufReader::with_capacity(64 << 10, File::open(&file)?);
-            let writer = outfile;
-            let mut scrombler = Scrombler::new(password, writer)?;
-            let mut last_block = None;
-
-            while last_block.is_none() {
-                match read_block(&mut infile) {
-                    BlockRead::ReadErr(e) => {
-                        return Err(e.into());
-                    }
-                    BlockRead::FullBlock(mut b) => {
-                        scrombler
-                            .encrypt_block(Plaintext(std::mem::replace(&mut b, Block::zero())))?;
-                    }
-                    BlockRead::FinalBlock(b) => last_block = Some(b),
-                }
-            }
-
-            scrombler.encrypt_last_bytes(last_block.unwrap())?;
-        }
-        Command::Decrypt {
-            legacy,
+        Command::Encrypt {
+            max_pad_factor,
             file,
             outfile,
         } => {
-            let outfile = open_outfile(outfile)?;
+            scromble(
+                password,
+                max_pad_factor,
+                Box::new(File::open(&file)?),
+                open_outfile(outfile)?,
+            )?;
+        }
 
-            let mut infile = std::io::BufReader::with_capacity(64 << 10, File::open(&file)?);
-            let writer = outfile;
+        Command::Decrypt { file, outfile } => {
+            descromble(password, Box::new(File::open(&file)?), open_outfile(outfile)?)?;
+        }
 
-            let mut descrombler = {
-                let blk1 = match read_block(&mut infile) {
-                    BlockRead::ReadErr(e) => Err(Box::<dyn std::error::Error>::from(e)),
-                    BlockRead::FullBlock(b) => Ok(b),
-                    BlockRead::FinalBlock(_) => Err(ScrombleError::BadLength.into()),
-                }?;
-                let blk2 = match read_block(&mut infile) {
-                    BlockRead::ReadErr(e) => Err(Box::<dyn std::error::Error>::from(e)),
-                    BlockRead::FullBlock(b) => Ok(b),
-                    BlockRead::FinalBlock(_) => Err(ScrombleError::BadLength.into()),
-                }?;
-                let mut checker = DescrombleCheck::new(
-                    password,
-                    writer,
-                    (*blk1).clone(),
-                    (*blk2).clone(),
-                    if legacy {
-                        Mode::Legacy
-                    } else {
-                        Mode::HipAndModern
-                    },
-                )?;
-                let mut last_block = None;
-
-                while last_block.is_none() {
-                    match read_block(&mut infile) {
-                        BlockRead::ReadErr(e) => {
-                            return Err(e.into());
-                        }
-                        BlockRead::FullBlock(b) => {
-                            checker.add_block((*b).clone());
-                        }
-                        BlockRead::FinalBlock(b) => last_block = Some(b),
-                    }
-                }
-
-                let last_block = last_block.unwrap();
-                if !last_block.is_empty() {
-                    return Err(ScrombleError::BadLength.into());
-                }
-
-                checker.finalize()?
-            };
-
-            infile.seek(SeekFrom::Start(0))?;
-
-            {
-                let /*blk1*/ _ = match read_block(&mut infile) {
-                    BlockRead::ReadErr(e)
-                        => Err(Box::<dyn std::error::Error>::from(e)),
-                    BlockRead::FullBlock(b) => Ok(b),
-                    BlockRead::FinalBlock(_)
-                        => Err(ScrombleError::BadLength.into()),
-                }?;
-                let /*blk2*/ _ = match read_block(&mut infile) {
-                    BlockRead::ReadErr(e)
-                        => Err(Box::<dyn std::error::Error>::from(e)),
-                    BlockRead::FullBlock(b) => Ok(b),
-                    BlockRead::FinalBlock(_)
-                        => Err(ScrombleError::BadLength.into()),
-                }?;
-
-                let mut last_block = None;
-
-                while last_block.is_none() {
-                    match read_block(&mut infile) {
-                        BlockRead::ReadErr(e) => {
-                            return Err(e.into());
-                        }
-                        BlockRead::FullBlock(b) => {
-                            descrombler.add_block((*b).clone())?;
-                        }
-                        BlockRead::FinalBlock(b) => last_block = Some(b),
-                    }
-                }
-
-                let last_block = last_block.unwrap();
-                if !last_block.is_empty() {
-                    return Err(ScrombleError::BadLength.into());
-                }
-
-                descrombler.finalize()?;
-            }
+        _ => {
+            unimplemented!();
         }
     }
     Ok(())

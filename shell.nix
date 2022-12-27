@@ -21,6 +21,8 @@ stdenv.mkDerivation {
   name = "moz_overlay_shell";
   buildInputs = [
     chan
+    libsodium
+    pkgconfig
   ];
 }
 
