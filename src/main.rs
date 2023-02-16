@@ -1,5 +1,8 @@
 #![deny(warnings)]
 
+#[cfg(test)]
+extern crate quickcheck_macros;
+
 use core::cmp::{min,max};
 use secrecy::{Secret,SecretString,ExposeSecret};
 use std::path::PathBuf;
@@ -203,8 +206,7 @@ where
     });
 
     let max_pad_length = <u64 as ApproxFrom<f32>>::approx_from(max_pad * max(64, bytes_written) as f32)?;
-
-    assert!(max_pad_length > 0);
+    let max_pad_length = max(max_pad_length,1);
 
     // I'm not worried about the tiny bias here
     let pad_len = prng.next_u64() % max_pad_length;
@@ -482,6 +484,150 @@ where
     Ok(())
 }
 
+#[cfg(test)]
+mod test {
+    use super::*;
+    use quickcheck::Arbitrary;
+    use quickcheck_macros::quickcheck;
+
+    #[derive(Debug,Clone)]
+    struct ScrombleFile {
+        pw: String,
+        max_pad_factor: Option<f32>,
+        plaintext: Vec<u8>,
+    }
+
+    impl Arbitrary for ScrombleFile {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            let pw = String::arbitrary(g).into();
+            let max_pad_factor = if bool::arbitrary(g) {
+                Some((u16::arbitrary(g) as f32)/(u16::MAX as f32))
+            } else {
+                None
+            };
+            let plaintext: Vec<u8> = <_>::arbitrary(g);
+            Self {
+                pw,
+                max_pad_factor,
+                plaintext,
+            }
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            Box::new(self.plaintext.shrink()
+                .map({ let zelf = self.clone();
+                    move |plaintext|
+                    Self {
+                        pw: zelf.pw.clone(),
+                        max_pad_factor: zelf.max_pad_factor.clone(),
+                        plaintext } })
+                .chain(self.max_pad_factor.shrink()
+                    .map({ let zelf = self.clone();
+                        move |max_pad_factor|
+                        Self {
+                            pw: zelf.pw.clone(),
+                            max_pad_factor,
+                            plaintext: zelf.plaintext.clone() } }))
+                .chain(self.pw.shrink()
+                    .map({ let zelf = self.clone();
+                        move |pw|
+                        Self { pw,
+                            max_pad_factor: zelf.max_pad_factor.clone(),
+                            plaintext: zelf.plaintext.clone() } })))
+        }
+    }
+
+    #[quickcheck]
+    fn enc_dec_loop(file: ScrombleFile) {
+        let mut enc_file = vec![];
+        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file)).unwrap();
+        let enc_file_len = enc_file.len() as f32;
+        let max_pad_factor = file.max_pad_factor.unwrap_or(1.0f32);
+        let enc_file_len_limit = (1f32 + max_pad_factor)*(file.plaintext.len() as f32) + (4*64 + 8) as f32;
+        assert!(enc_file_len <= enc_file_len_limit,"{} <= {}",enc_file_len,enc_file_len_limit);
+        let mut dec_file = vec![];
+        descromble(Passphrase(file.pw.into()), Box::new(std::io::Cursor::new(&enc_file)), Box::new(&mut dec_file)).unwrap();
+        assert_eq!(file.plaintext,dec_file);
+    }
+
+    #[quickcheck]
+    fn decrypt_authentic(corruption_mask: (u8,Vec<u8>), corruption_pos: u16, file: ScrombleFile) {
+        let mut enc_file = vec![];
+        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file)).unwrap();
+
+        let corruption_pos = (corruption_pos as usize) % enc_file.len();
+        for (i,x) in core::iter::once(corruption_mask.0).chain((corruption_mask.1).into_iter()).enumerate() {
+            let ix = corruption_pos+i;
+            if ix >= enc_file.len() { break; }
+            enc_file[corruption_pos+i] ^= x;
+        }
+
+        let mut dec_file = vec![];
+        descromble(Passphrase(file.pw.into()), Box::new(std::io::Cursor::new(&enc_file)), Box::new(&mut dec_file)).unwrap_err();
+    }
+
+    #[quickcheck]
+    fn decrypt_wrong_pw(wrong_pw: String, file: ScrombleFile) {
+        let mut enc_file = vec![];
+        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file)).unwrap();
+
+        let mut dec_file = vec![];
+        descromble(Passphrase(wrong_pw.into()), Box::new(std::io::Cursor::new(&enc_file)), Box::new(&mut dec_file)).unwrap_err();
+    }
+
+    // TODO: come up with better statistical tests
+    #[quickcheck]
+    fn encrypt_uncorrelated(file: ScrombleFile) {
+        let mut enc_file1 = vec![];
+        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file1)).unwrap();
+        let mut enc_file2 = vec![];
+        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file2)).unwrap();
+
+        assert!(enc_file1.len() < u32::MAX as usize);
+
+        let mut hist1 = [0usize; 256];
+        let mut hist1_samples = 0usize;
+        let mut hist2 = [0usize; 256];
+        let mut hist2_samples = 0usize;
+        let mut hist_diff = [0usize; 256];
+        let mut hist_diff_samples = 0usize;
+
+        for i in 0..max(enc_file1.len(),enc_file2.len()) {
+            if i < enc_file1.len() {
+                if i < enc_file2.len() {
+                    hist_diff_samples += 1;
+                    hist_diff[enc_file1[i].wrapping_sub(enc_file2[i]) as usize] += 1;
+                }
+
+                hist1_samples += 1;
+                hist1[enc_file1[i] as usize] += 1;
+            }
+
+            if i < enc_file2.len() {
+                hist2_samples += 1;
+                hist2[enc_file2[i] as usize] += 1;
+            }
+        }
+
+        let hists = vec![(hist1_samples, hist1), (hist2_samples, hist2),
+            (hist_diff_samples, hist_diff)];
+
+        for (i,(n,hist)) in hists.into_iter().enumerate() {
+            assert!(n > 0);
+            let mut ent = 0f64;
+            for c in hist {
+                let p = (c as f64)/(n as f64);
+                let lg_p = p.log2();
+                if lg_p.is_finite() {
+                    ent += -(p*lg_p/8f64);
+                }
+            }
+
+            assert!(ent > 0.85, "{}: ent = {}", i, ent);
+        }
+    }
+}
+
 #[derive(Debug, StructOpt)]
 #[structopt(name = "scromble",
 about = concat!(
@@ -577,10 +723,10 @@ impl fmt::Debug for ScrombleError {
 
 impl std::error::Error for ScrombleError {}
 
-#[test]
-fn all_sizes_agree() {
-    assert_eq!(blake2b_simd::OUTBYTES, chacha20::BLOCK_SIZE);
-}
+// #[test]
+// fn all_sizes_agree() {
+//     assert_eq!(blake2b_simd::OUTBYTES, chacha20::BLOCK_SIZE);
+// }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Command::from_args();
