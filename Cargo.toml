@@ -34,5 +34,5 @@ subtle = { version = "2.4.1" }
 digest = { version = "0.10.6" }
 
 [dev-dependencies]
-quickcheck_macros = "*"
+quickcheck_macros = "1.0.0"
 
