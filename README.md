@@ -77,11 +77,11 @@ through simple optimizations or by multithreading it.
 Is this reliable?
 =================
 
-I made this in a day and it hasn't been independently audited (yet).
-It is built using fairly reputable Rust-based implementations of the
+I originally made this in a day and it hasn't been independently audited
+(yet). It is built using fairly reputable Rust-based implementations of the
 involved cryptographic primitives, and it is simple enough that there
-shouldn't be many subtle ways for it to be implemented incorrectly. I
-am willing to use it for my own needs, but as they say:
+shouldn't be many subtle ways for it to be implemented incorrectly. I am
+willing to use it for my own needs, but as they say:
 
 ```
   THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
