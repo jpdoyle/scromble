@@ -56,68 +56,13 @@ Example usage
     $ diff -b mydata.enc*
     # should fail, leaving mydata3.txt empty
     $ echo notmypassword | scromble decrypt mydata.enc2 >mydata3.txt
-    Error: BadHmac
+    Error: Ciphertext has an incorrect HMAC
 
 What cryptography does this use?
 ================================
 
-NOTE: if any of the below information seems wrong, please file an
-issue!
-
-There are two formats, "hip and modern" and "legacy". "hip and modern" is
-the default, and "legacy" only supports decryption.
-
-Random byte generation is done with Rust's `thread_rng()`, which is a
-CSPRNG (right now, I believe it's ChaCha20).
-
-Key derivation is done by running `argon2i` on the input password,
-mixed with a 64-byte salt.
-
-Encryption is done with `XChaCha20`, with a 24 byte (192bit) nonce. In
-"legacy" mode a hack is used when the keystream becomes very large:
-
-- If the keystream extends to `core::u32::MAX/2` (ie, `2^31`, about
-  128gb), it generates a key and a nonce from the keystream, and uses
-  those to reinitialize XChaCha20. This can happen an unlimited number
-  of times.
-
-MAC is done with 64-byte-output `blake2b`, personalized with
-`b"sCrOmBlEnCrYpToR"`. Its key is generated from the first 32 bytes of
-the XChaCha20 keystream.
-
-In both "hip and modern" mode and "legacy" mode, the MAC input starts with
-all non-final blocks as they appear in the file (ie, all blocks as
-described in the next section except `[HMAC]`).
-
-In "legacy" mode, the MAC input ends there.
-
-In "hip and modern" mode, one block of stream-encrypted `0`s is appended to
-the MAC input. This prevents data corruption that if the stream cipher is
-changed in a way that would generate the same HMAC key with an
-eventually-different overall keystream. The primary purpose is to ensure
-that "legacy" files which might be incorrectly decrypted will instead fail
-the HMAC check.
-
-What do encrypted files look like?
-==================================
-
-Encrypted files are in 64-byte blocks (notated as `[...]`). `|` means
-concatenation.
-
-Header:
-
-    [salt]|[nonce|random_bytes]
-
-Body:
-
-    [ciphertext]...
-
-Footer:
-
-    [last_ciphertext|random_bytes]|[64-len(last_ciphertext)|random_bytes]|[HMAC]
-
-`random_bytes` are taken from the `XChaCha20` keystream to pad blocks
-to a multiple of 64 bytes.
+For detailed information on the overall design, please see `DESIGN.md` or
+run `scromble explain-design`.
 
 Is this fast?
 =============
