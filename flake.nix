@@ -2,7 +2,7 @@
   description = "A devShell example";
 
   inputs = {
-    nixpkgs.url      = github:nixos/nixpkgs/nixos-21.11;
+    nixpkgs.url      = github:nixos/nixpkgs/nixos-24.11;
     flake-utils.url  = github:numtide/flake-utils;
     rust-overlay.url = github:oxalica/rust-overlay;
   };
@@ -16,7 +16,7 @@
         };
       in
       with pkgs;
-      {
+      rec {
         devShell = mkShell {
           buildInputs = [
             openssl
@@ -26,6 +26,13 @@
 
           RUST_BACKTRACE="full";
         };
+        packages.scromble = rustPlatform.buildRustPackage rec {
+          name = "scromble-${version}";
+          version = if (self ? rev) then self.rev else "dirty";
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+        };
+        packages.default = packages.scromble;
       }
     );
 }
