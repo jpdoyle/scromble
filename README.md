@@ -18,15 +18,15 @@ things. So I made one.
 Building
 ========
 
-Running `nix-shell --command 'cargo build --release'` should work. The
+Running `nix develop --command cargo build --release` should work. The
 executable will then be in `./target/release/scromble`. Please file an
 issue if that doesn't work!
 
 If you would like to use the AVX2 backend for XChaCha20, build with
-`nix-shell --command 'RUSTFLAGS="-Ctarget-cpu=haswell
--Ctarget-feature=+sse2" cargo build --release'` instead. Everything
-else should be the same. The fastest results I've seen are expected
-with `RUSTFLAGS="-Ctarget-cpu=native"`.
+`RUSTFLAGS="-Ctarget-cpu=haswell -Ctarget-feature=+sse2" nix develop
+--command cargo build --release` instead. Everything else should be the
+same. The fastest results I've seen are expected with
+`RUSTFLAGS="-Ctarget-cpu=native"`.
 
 NOTE FOR WINDOWS USERS
 ======================
