@@ -3,28 +3,28 @@
 #[cfg(test)]
 extern crate quickcheck_macros;
 
-use core::cmp::{min,max};
-use secrecy::{SecretString,ExposeSecret,SecretBox};
-use std::path::PathBuf;
-use clap::{StructOpt,ValueEnum};
-use clap_complete::{
-    generate,generate_to,
-    Shell
-};
 use blake2::Blake2bMac;
+use clap::{StructOpt, ValueEnum};
+use clap_complete::{generate, generate_to, Shell};
+use conv::ApproxFrom;
+use core::cmp::{max, min};
+use digest::{FixedOutput, Mac};
+use generic_array::{ArrayLength, GenericArray};
+use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use typenum::{IsLessOrEqual,LeEq,consts::{U32,U64},NonZero};
-use rand::{SeedableRng,RngCore};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
+use std::convert::TryInto;
 use std::fmt;
 use std::fs::File;
+use std::io::ErrorKind;
 use std::io::Seek;
 use std::io::Write;
-use std::io::ErrorKind;
-use generic_array::{GenericArray,ArrayLength};
+use std::path::PathBuf;
 use subtle::ConstantTimeEq;
-use digest::{FixedOutput,Mac};
-use conv::ApproxFrom;
-use std::convert::TryInto;
+use typenum::{
+    consts::{U32, U64},
+    IsLessOrEqual, LeEq, NonZero,
+};
 
 enum ScrombleError {
     TooShort,
@@ -60,36 +60,42 @@ impl fmt::Debug for ScrombleError {
 
 impl std::error::Error for ScrombleError {}
 
-
 ///// begin unfortunate vendored XChaCha20 impl //////
 
 mod chacha {
     use super::*;
 
-    use zeroize::{DefaultIsZeroes};//,Zeroize};//,ZeroizeOnDrop};
+    use zeroize::DefaultIsZeroes; //,Zeroize};//,ZeroizeOnDrop};
 
-    #[derive(Default,Clone,Copy)]
-    struct ChaChaKey(pub [u32;8]);
+    #[derive(Default, Clone, Copy)]
+    struct ChaChaKey(pub [u32; 8]);
     impl DefaultIsZeroes for ChaChaKey {}
 
-    #[derive(Default,Clone,Copy)]
-    struct ChaChaState(pub [u32;16]);
+    #[derive(Default, Clone, Copy)]
+    struct ChaChaState(pub [u32; 16]);
     impl DefaultIsZeroes for ChaChaState {}
 
-    #[derive(Default,Clone,Copy)]
-    struct ChaChaNonce(pub [u32;2]);
+    #[derive(Default, Clone, Copy)]
+    struct ChaChaNonce(pub [u32; 2]);
     impl DefaultIsZeroes for ChaChaNonce {}
 
-    #[derive(Default,Clone,Copy)]
-    struct HChaChaNonce(pub [u32;4]);
+    #[derive(Default, Clone, Copy)]
+    struct HChaChaNonce(pub [u32; 4]);
     impl zeroize::DefaultIsZeroes for HChaChaNonce {}
 
     /// State initialization constant ("expand 32-byte k")
 
-    const CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
+    const CONSTANTS: [u32; 4] =
+        [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
     /// The ChaCha20 quarter round function
-    fn quarter_round(a: usize, b: usize, c: usize, d: usize, state: &mut ChaChaState) {
+    fn quarter_round(
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        state: &mut ChaChaState,
+    ) {
         state.0[a] = state.0[a].wrapping_add(state.0[b]);
         state.0[d] ^= state.0[a];
         state.0[d] = state.0[d].rotate_left(16);
@@ -125,7 +131,10 @@ mod chacha {
     }
 
     #[inline(always)]
-    fn run_rounds(double_rounds: usize, state: &ChaChaState) -> ChaChaState {
+    fn run_rounds(
+        double_rounds: usize,
+        state: &ChaChaState,
+    ) -> ChaChaState {
         let mut res = *state;
 
         run_rounds_inner(double_rounds, &mut res);
@@ -153,7 +162,7 @@ mod chacha {
         let mut state = ChaChaState::default();
         state.0[..4].copy_from_slice(&CONSTANTS);
 
-        state.0[ 4..12].copy_from_slice(&key.0[..]);
+        state.0[4..12].copy_from_slice(&key.0[..]);
         state.0[12..16].copy_from_slice(&nonce.0[..]);
 
         run_rounds_inner(10, &mut state);
@@ -166,24 +175,31 @@ mod chacha {
         output
     }
 
-    fn chacha20_apply_block(key: &ChaChaKey, nonce: &ChaChaNonce, block_ix: u64, pt: &mut [u8; 64]) {
+    fn chacha20_apply_block(
+        key: &ChaChaKey,
+        nonce: &ChaChaNonce,
+        block_ix: u64,
+        pt: &mut [u8; 64],
+    ) {
         let mut state = ChaChaState::default();
         state.0[..4].copy_from_slice(&CONSTANTS);
 
         state.0[4..12].copy_from_slice(&key.0[..]);
 
         state.0[12] = (block_ix & 0xffff_ffff) as u32;
-        state.0[13] = ((block_ix>>32) & 0xffff_ffff) as u32;
+        state.0[13] = ((block_ix >> 32) & 0xffff_ffff) as u32;
         state.0[14] = nonce.0[0];
         state.0[15] = nonce.0[1];
 
-        state = run_rounds(10,&state);
+        state = run_rounds(10, &state);
 
-        for (b, mask) in pt.iter_mut().zip(state.0.iter().flat_map(|x| x.to_le_bytes())) {
+        for (b, mask) in pt
+            .iter_mut()
+            .zip(state.0.iter().flat_map(|x| x.to_le_bytes()))
+        {
             *b ^= mask;
         }
     }
-
 
     pub struct CipherState {
         key: SecretBox<ChaChaKey>,
@@ -193,46 +209,73 @@ mod chacha {
     }
 
     impl CipherState {
-        pub fn new(key_bytes: &[u8;32], nonce_bytes: &[u8;24]) -> Self {
+        pub fn new(key_bytes: &[u8; 32], nonce_bytes: &[u8; 24]) -> Self {
             let nonce = SecretBox::<ChaChaNonce>::init_with_mut(|n| {
-                n.0[0] = u32::from_le_bytes(nonce_bytes[16..20].try_into().unwrap());
-                n.0[1] = u32::from_le_bytes(nonce_bytes[20..24].try_into().unwrap());
+                n.0[0] = u32::from_le_bytes(
+                    nonce_bytes[16..20].try_into().unwrap(),
+                );
+                n.0[1] = u32::from_le_bytes(
+                    nonce_bytes[20..24].try_into().unwrap(),
+                );
             });
             let key = SecretBox::<ChaChaKey>::init_with_mut(|k| {
-                for (k,val) in k.0.iter_mut()
-                                .zip(key_bytes.chunks_exact(4)
-                                                 .map(|b| b.try_into().unwrap())
-                                                 .map(u32::from_le_bytes)) {
+                for (k, val) in k.0.iter_mut().zip(
+                    key_bytes
+                        .chunks_exact(4)
+                        .map(|b| b.try_into().unwrap())
+                        .map(u32::from_le_bytes),
+                ) {
                     *k = val;
                 }
 
                 let nonce: HChaChaNonce = HChaChaNonce([
-                    u32::from_le_bytes(nonce_bytes[ 0.. 4].try_into().unwrap()),
-                    u32::from_le_bytes(nonce_bytes[ 4.. 8].try_into().unwrap()),
-                    u32::from_le_bytes(nonce_bytes[ 8..12].try_into().unwrap()),
-                    u32::from_le_bytes(nonce_bytes[12..16].try_into().unwrap()),
+                    u32::from_le_bytes(
+                        nonce_bytes[0..4].try_into().unwrap(),
+                    ),
+                    u32::from_le_bytes(
+                        nonce_bytes[4..8].try_into().unwrap(),
+                    ),
+                    u32::from_le_bytes(
+                        nonce_bytes[8..12].try_into().unwrap(),
+                    ),
+                    u32::from_le_bytes(
+                        nonce_bytes[12..16].try_into().unwrap(),
+                    ),
                 ]);
 
                 *k = hchacha(*k, nonce);
             });
 
             Self {
-                key, nonce, block_ix: 0, offset: 0
+                key,
+                nonce,
+                block_ix: 0,
+                offset: 0,
             }
         }
 
-        pub fn try_seek<U: Into<u128>>(&mut self, pos: U) -> Result<(),ScrombleError> {
+        pub fn try_seek<U: Into<u128>>(
+            &mut self,
+            pos: U,
+        ) -> Result<(), ScrombleError> {
             let pos: u128 = pos.into();
-            let offset = (pos&0x3F) as u8;
-            let block_ix: u64 = (pos>>6).try_into().map_err(|_| ScrombleError::Overflow)?;
+            let offset = (pos & 0x3F) as u8;
+            let block_ix: u64 = (pos >> 6)
+                .try_into()
+                .map_err(|_| ScrombleError::Overflow)?;
             self.block_ix = block_ix;
             self.offset = offset;
             Ok(())
         }
 
-        pub fn try_apply_keystream(&mut self, mut buffer: &mut [u8]) -> Result<(),ScrombleError> {
-            let final_pos: u128 = ((self.block_ix as u128)*64 + (self.offset as u128)).saturating_add(buffer.len() as u128);
-            if final_pos > (1u128<<(64+6)) {
+        pub fn try_apply_keystream(
+            &mut self,
+            mut buffer: &mut [u8],
+        ) -> Result<(), ScrombleError> {
+            let final_pos: u128 = ((self.block_ix as u128) * 64
+                + (self.offset as u128))
+                .saturating_add(buffer.len() as u128);
+            if final_pos > (1u128 << (64 + 6)) {
                 return Err(ScrombleError::Overflow);
             }
 
@@ -244,14 +287,21 @@ mod chacha {
             let mut block_ix = self.block_ix;
 
             if offset > 0 {
-                let num_bytes = min(buffer.len(), 64-(offset as usize));
+                let num_bytes = min(buffer.len(), 64 - (offset as usize));
                 let mut block = [0u8; 64];
                 let off = offset as usize;
-                block[off..off+num_bytes].copy_from_slice(&buffer[..num_bytes]);
+                block[off..off + num_bytes]
+                    .copy_from_slice(&buffer[..num_bytes]);
 
-                chacha20_apply_block(self.key.expose_secret(), self.nonce.expose_secret(), block_ix, &mut block);
+                chacha20_apply_block(
+                    self.key.expose_secret(),
+                    self.nonce.expose_secret(),
+                    block_ix,
+                    &mut block,
+                );
 
-                buffer[..num_bytes].copy_from_slice(&block[off..off+num_bytes]);
+                buffer[..num_bytes]
+                    .copy_from_slice(&block[off..off + num_bytes]);
 
                 offset += num_bytes as u8;
                 buffer = &mut buffer[num_bytes..];
@@ -270,16 +320,23 @@ mod chacha {
             }
 
             while buffer.len() >= 64 {
-                assert_eq!(offset,0);
+                assert_eq!(offset, 0);
 
                 let mut block = [0u8; 64];
                 block[..].copy_from_slice(&buffer[..64]);
 
-                chacha20_apply_block(self.key.expose_secret(), self.nonce.expose_secret(), block_ix, &mut block);
+                chacha20_apply_block(
+                    self.key.expose_secret(),
+                    self.nonce.expose_secret(),
+                    block_ix,
+                    &mut block,
+                );
 
                 buffer[..64].copy_from_slice(&block[..]);
 
-                block_ix = block_ix.checked_add(1).ok_or(ScrombleError::Overflow)?;
+                block_ix = block_ix
+                    .checked_add(1)
+                    .ok_or(ScrombleError::Overflow)?;
 
                 buffer = &mut buffer[64..];
             }
@@ -291,7 +348,12 @@ mod chacha {
                 let mut block = [0u8; 64];
                 block[..buffer.len()].copy_from_slice(&buffer[..]);
 
-                chacha20_apply_block(self.key.expose_secret(), self.nonce.expose_secret(), block_ix, &mut block);
+                chacha20_apply_block(
+                    self.key.expose_secret(),
+                    self.nonce.expose_secret(),
+                    block_ix,
+                    &mut block,
+                );
 
                 let buflen = buffer.len();
                 buffer[..].copy_from_slice(&block[..buflen]);
@@ -320,18 +382,20 @@ mod chacha {
             };
 
             let mut expected_answer = [
-                0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90, 0x40, 0x5d,
-                0x6a, 0xe5, 0x53, 0x86, 0xbd, 0x28, 0xbd, 0xd2, 0x19, 0xb8,
-                0xa0, 0x8d, 0xed, 0x1a, 0xa8, 0x36, 0xef, 0xcc, 0x8b, 0x77,
-                0x0d, 0xc7, 0xda, 0x41, 0x59, 0x7c, 0x51, 0x57, 0x48, 0x8d,
-                0x77, 0x24, 0xe0, 0x3f, 0xb8, 0xd8, 0x4a, 0x37, 0x6a, 0x43,
-                0xb8, 0xf4, 0x15, 0x18, 0xa1, 0x1c, 0xc3, 0x87, 0xb6, 0x69,
-                0xb2, 0xee, 0x65, 0x86];
+                0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90, 0x40,
+                0x5d, 0x6a, 0xe5, 0x53, 0x86, 0xbd, 0x28, 0xbd, 0xd2,
+                0x19, 0xb8, 0xa0, 0x8d, 0xed, 0x1a, 0xa8, 0x36, 0xef,
+                0xcc, 0x8b, 0x77, 0x0d, 0xc7, 0xda, 0x41, 0x59, 0x7c,
+                0x51, 0x57, 0x48, 0x8d, 0x77, 0x24, 0xe0, 0x3f, 0xb8,
+                0xd8, 0x4a, 0x37, 0x6a, 0x43, 0xb8, 0xf4, 0x15, 0x18,
+                0xa1, 0x1c, 0xc3, 0x87, 0xb6, 0x69, 0xb2, 0xee, 0x65,
+                0x86,
+            ];
 
             state.try_apply_keystream(&mut expected_answer[..]).unwrap();
             let mut i = 0;
             for x in expected_answer {
-                assert_eq!(x,0,"{}",i);
+                assert_eq!(x, 0, "{}", i);
                 i += 1;
             }
         }
@@ -339,32 +403,34 @@ mod chacha {
         #[test]
         fn xchacha_known_answer() {
             let key = [
-                0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
-                0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93,
-                0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d,
-                0x9e, 0x9f,
+                0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
+                0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91,
+                0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a,
+                0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
             ];
             let nonce = [
-                0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
-                0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53,
-                0x54, 0x55, 0x56, 0x58,
+                0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+                0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51,
+                0x52, 0x53, 0x54, 0x55, 0x56, 0x58,
             ];
-            let mut state = CipherState::new(&key,&nonce);
+            let mut state = CipherState::new(&key, &nonce);
 
             let mut expected_answers = [
                 vec![
-                    0x29, 0x62, 0x4b, 0x4b, 0x1b, 0x14, 0x0a, 0xce, 0x53, 0x74,
-                    0x0e, 0x40, 0x5b, 0x21, 0x68
+                    0x29, 0x62, 0x4b, 0x4b, 0x1b, 0x14, 0x0a, 0xce, 0x53,
+                    0x74, 0x0e, 0x40, 0x5b, 0x21, 0x68,
                 ],
-                vec![ 0x54, 0x0f ],
+                vec![0x54, 0x0f],
             ];
 
             state.try_seek(64u64).unwrap();
             let mut i = 0;
             for expected_answer in expected_answers.iter_mut() {
-                state.try_apply_keystream(&mut expected_answer[..]).unwrap();
+                state
+                    .try_apply_keystream(&mut expected_answer[..])
+                    .unwrap();
                 for x in expected_answer {
-                    assert_eq!(*x,0,"{}",i);
+                    assert_eq!(*x, 0, "{}", i);
                     i += 1;
                 }
             }
@@ -381,35 +447,48 @@ mod chacha {
         //
 
         const KEY: [u8; 32] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+            0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
             0x1e, 0x1f,
         ];
 
         const INPUT: [u8; 16] = [
-            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00, 0x31, 0x41, 0x59,
-            0x27,
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00,
+            0x00, 0x00, 0x31, 0x41, 0x59, 0x27,
         ];
 
         const OUTPUT: [u8; 32] = [
-            0x82, 0x41, 0x3b, 0x42, 0x27, 0xb2, 0x7b, 0xfe, 0xd3, 0xe, 0x42, 0x50, 0x8a, 0x87, 0x7d,
-            0x73, 0xa0, 0xf9, 0xe4, 0xd5, 0x8a, 0x74, 0xa8, 0x53, 0xc1, 0x2e, 0xc4, 0x13, 0x26, 0xd3,
+            0x82, 0x41, 0x3b, 0x42, 0x27, 0xb2, 0x7b, 0xfe, 0xd3, 0xe,
+            0x42, 0x50, 0x8a, 0x87, 0x7d, 0x73, 0xa0, 0xf9, 0xe4, 0xd5,
+            0x8a, 0x74, 0xa8, 0x53, 0xc1, 0x2e, 0xc4, 0x13, 0x26, 0xd3,
             0xec, 0xdc,
         ];
 
         #[test]
         fn test_vector() {
-            let key: [u32;8] = KEY.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>().try_into().unwrap();
-            let nonce: [u32;4] = INPUT.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>().try_into().unwrap();
-            let output: [u32;8] = OUTPUT.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>().try_into().unwrap();
-            let actual = hchacha(
-                ChaChaKey(key),
-                HChaChaNonce(nonce),
-            );
+            let key: [u32; 8] = KEY
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let nonce: [u32; 4] = INPUT
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let output: [u32; 8] = OUTPUT
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let actual = hchacha(ChaChaKey(key), HChaChaNonce(nonce));
             assert_eq!(actual.0, output);
         }
     }
-
 }
 
 ///// end   unfortunate vendored XChaCha20 impl //////
@@ -427,8 +506,12 @@ where
     N: ArrayLength<u8> + IsLessOrEqual<U64>,
     LeEq<N, U64>: NonZero,
 {
-    let mut hasher =
-        Blake2bMac::<N>::new_with_salt_and_personal(k, &[], "sCrOmB2EnCrYpToR".as_bytes()).unwrap();
+    let mut hasher = Blake2bMac::<N>::new_with_salt_and_personal(
+        k,
+        &[],
+        "sCrOmB2EnCrYpToR".as_bytes(),
+    )
+    .unwrap();
     for d in data {
         hasher.update(d);
     }
@@ -436,11 +519,11 @@ where
 }
 
 // struct RootKey(Zeroizing<Secret<[u8; 64]>>);
-#[derive(Clone,Copy)]
+#[derive(Clone, Copy)]
 struct RootKeyInner([u8; 64]);
 impl Default for RootKeyInner {
     fn default() -> Self {
-        Self([0u8;64])
+        Self([0u8; 64])
     }
 }
 impl zeroize::DefaultIsZeroes for RootKeyInner {}
@@ -449,7 +532,7 @@ struct RootKey(SecretBox<RootKeyInner>);
 struct Passphrase(SecretString);
 #[derive(Clone)]
 // struct Nonce(chacha20::XNonce);
-struct Nonce([u8;24]);
+struct Nonce([u8; 24]);
 #[derive(Clone)]
 struct NonceBlock(Nonce, [u8; 40]);
 struct Salt([u8; 64]);
@@ -495,27 +578,40 @@ impl RootKey {
             hash_with_tag(a2id, "argon2id")
         };
 
-        Self(SecretBox::<RootKeyInner>::init_with_mut(|rk|
-            rk.0.copy_from_slice(key2b::<U64>(
-                &[0u8; 64],
-                &["root".as_bytes(), &rk_i, &rk_id],
-            ).as_slice())
-        ))
+        Self(SecretBox::<RootKeyInner>::init_with_mut(|rk| {
+            rk.0.copy_from_slice(
+                key2b::<U64>(
+                    &[0u8; 64],
+                    &["root".as_bytes(), &rk_i, &rk_id],
+                )
+                .as_slice(),
+            )
+        }))
     }
 
-    fn create_states(self, nonce: Nonce) -> (Box<chacha::CipherState>, HmacState) {
-        let hmac_key = key2b::<U64>(&self.0.expose_secret().0, &["hmac".as_bytes()]);
-        let hmac = Box::new(Blake2bMac::new_with_salt_and_personal(
-            &hmac_key,
-            &[],
-            "sCrOmB2AuThEnTiC".as_bytes(),
-        ).unwrap());
-        let cipher_key = key2b::<U32>(&self.0.expose_secret().0, &["encrypt".as_bytes()]);
+    fn create_states(
+        self,
+        nonce: Nonce,
+    ) -> (Box<chacha::CipherState>, HmacState) {
+        let hmac_key =
+            key2b::<U64>(&self.0.expose_secret().0, &["hmac".as_bytes()]);
+        let hmac = Box::new(
+            Blake2bMac::new_with_salt_and_personal(
+                &hmac_key,
+                &[],
+                "sCrOmB2AuThEnTiC".as_bytes(),
+            )
+            .unwrap(),
+        );
+        let cipher_key = key2b::<U32>(
+            &self.0.expose_secret().0,
+            &["encrypt".as_bytes()],
+        );
 
         // let cipher = Box::new(<chacha20::XChaCha20 as cipher::KeyIvInit>::new(
 
         let cipher = Box::new(chacha::CipherState::new(
-            &<[u8;32]>::from(cipher_key),
+            &<[u8; 32]>::from(cipher_key),
             &nonce.0,
         ));
         (cipher, hmac)
@@ -549,15 +645,17 @@ where
         NonceBlock(Nonce(nonce_buf), rest_buf)
     };
 
-    let (mut cipher, mut mac_state) = RootKey::new(pw, &salt).create_states(nonce.0.clone());
+    let (mut cipher, mut mac_state) =
+        RootKey::new(pw, &salt).create_states(nonce.0.clone());
 
     let mut buffer = [0u8; 64 << 10];
 
-    let mut write_data = |buf: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
-        writer.write_all(buf)?;
-        mac_state.update(buf);
-        Ok(())
-    };
+    let mut write_data =
+        |buf: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
+            writer.write_all(buf)?;
+            mac_state.update(buf);
+            Ok(())
+        };
 
     // write SB
     write_data(&salt.0)?;
@@ -605,12 +703,15 @@ where
         } else if bytes_written <= 2048 {
             1.0
         } else {
-            1.0 - 0.8 * ((bytes_written as f32) - 2048f32) / (65536f32 - 2048f32)
+            1.0 - 0.8 * ((bytes_written as f32) - 2048f32)
+                / (65536f32 - 2048f32)
         }
     });
 
-    let max_pad_length = <u64 as ApproxFrom<f32>>::approx_from(max_pad * max(64, bytes_written) as f32)?;
-    let max_pad_length = max(max_pad_length,1);
+    let max_pad_length = <u64 as ApproxFrom<f32>>::approx_from(
+        max_pad * max(64, bytes_written) as f32,
+    )?;
+    let max_pad_length = max(max_pad_length, 1);
 
     // I'm not worried about the tiny bias here
     let pad_len = prng.next_u64() % max_pad_length;
@@ -653,14 +754,17 @@ struct HmacTable<R: std::io::Read + std::io::Seek + ?Sized> {
 }
 
 impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
-    fn new(mut hmac: HmacState, mut reader: Box<R>) -> Result<(Self,u64,[u8;8]), Box<dyn std::error::Error>> {
+    fn new(
+        mut hmac: HmacState,
+        mut reader: Box<R>,
+    ) -> Result<(Self, u64, [u8; 8]), Box<dyn std::error::Error>> {
         let init_hmac = hmac.clone();
         let mut block_size = 4 << 10;
         let mut total_bytes_read = 0u64;
 
         let mut buf = vec![0; block_size + HMAC_SIZE];
         let mut bytes_in_buf = 0;
-        let mut last_8_bytes = [0u8;8];
+        let mut last_8_bytes = [0u8; 8];
 
         let mut prefix_hashes = vec![];
 
@@ -676,19 +780,27 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                         hmac.update(&buf[..block_size]);
                         prefix_hashes.push(hmac.clone().finalize_fixed());
 
-                        last_8_bytes.copy_from_slice(&buf[block_size-8..block_size]);
-                        let hmac_part: [u8; HMAC_SIZE] = (&buf[block_size..]).try_into().unwrap();
+                        last_8_bytes.copy_from_slice(
+                            &buf[block_size - 8..block_size],
+                        );
+                        let hmac_part: [u8; HMAC_SIZE] =
+                            (&buf[block_size..]).try_into().unwrap();
                         bytes_in_buf = hmac_part.len();
                         buf[..bytes_in_buf].copy_from_slice(&hmac_part);
 
                         if prefix_hashes.len() % 2 == 0
-                            && prefix_hashes.len() / 2 >= block_size / HMAC_SIZE
+                            && prefix_hashes.len() / 2
+                                >= block_size / HMAC_SIZE
                         {
                             block_size *= 2; // TODO: checked
                             for i in 0..prefix_hashes.len() / 2 {
-                                prefix_hashes[i] = prefix_hashes[2 * i + 1];
+                                prefix_hashes[i] =
+                                    prefix_hashes[2 * i + 1];
                             }
-                            prefix_hashes.resize(prefix_hashes.len() / 2, Default::default());
+                            prefix_hashes.resize(
+                                prefix_hashes.len() / 2,
+                                Default::default(),
+                            );
                             buf.resize(block_size + HMAC_SIZE, 0);
                         }
                     }
@@ -710,17 +822,20 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
         hmac.update(&buf[..(bytes_in_buf - HMAC_SIZE)]);
 
         if bytes_in_buf >= HMAC_SIZE {
-            let l8b_included = min(8,bytes_in_buf-HMAC_SIZE);
-            let buf_end = bytes_in_buf-HMAC_SIZE;
+            let l8b_included = min(8, bytes_in_buf - HMAC_SIZE);
+            let buf_end = bytes_in_buf - HMAC_SIZE;
 
-            last_8_bytes[8-l8b_included..].copy_from_slice(&buf[buf_end-l8b_included..buf_end]);
+            last_8_bytes[8 - l8b_included..]
+                .copy_from_slice(&buf[buf_end - l8b_included..buf_end]);
         }
 
         let final_mac = hmac.finalize_fixed();
 
-        if !<bool>::from(final_mac.as_slice()
-            .ct_eq(&buf[bytes_in_buf - HMAC_SIZE..bytes_in_buf]))
-        {
+        if !<bool>::from(
+            final_mac
+                .as_slice()
+                .ct_eq(&buf[bytes_in_buf - HMAC_SIZE..bytes_in_buf]),
+        ) {
             return Err(ScrombleError::BadHmac.into());
         }
 
@@ -730,28 +845,39 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
 
         reader.rewind()?;
 
-        Ok((Self {
-            bytes_remaining: total_bytes_read,
-            block_size: block_size.try_into().unwrap(),
-            hashes_reversed: prefix_hashes,
-            inner_buffer: vec![0u8; block_size + HMAC_SIZE],
-            hmac: init_hmac,
-            reader,
-            bytes_in_buffer: 0,
-        },total_bytes_read,last_8_bytes))
+        Ok((
+            Self {
+                bytes_remaining: total_bytes_read,
+                block_size: block_size.try_into().unwrap(),
+                hashes_reversed: prefix_hashes,
+                inner_buffer: vec![0u8; block_size + HMAC_SIZE],
+                hmac: init_hmac,
+                reader,
+                bytes_in_buffer: 0,
+            },
+            total_bytes_read,
+            last_8_bytes,
+        ))
     }
 
-    fn next(&mut self, mut buffer: Vec<u8>) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    fn next(
+        &mut self,
+        mut buffer: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         if self.bytes_remaining == 0 {
             return Ok(None);
         }
 
         buffer.resize(self.block_size as usize + HMAC_SIZE, 0);
-        let mut buffer = core::mem::replace(&mut self.inner_buffer, buffer);
+        let mut buffer =
+            core::mem::replace(&mut self.inner_buffer, buffer);
         assert_eq!(buffer.len(), self.block_size as usize + HMAC_SIZE);
 
         loop {
-            match self.reader.read(&mut buffer[self.bytes_in_buffer as usize..]) {
+            match self
+                .reader
+                .read(&mut buffer[self.bytes_in_buffer as usize..])
+            {
                 Ok(0) => {
                     break;
                 }
@@ -763,20 +889,28 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                         .ok_or(ScrombleError::FileChanged)?;
 
                     if self.bytes_in_buffer == buffer.len() as u64 {
-                        self.hmac.update(&buffer[..self.block_size as usize]);
+                        self.hmac
+                            .update(&buffer[..self.block_size as usize]);
 
-                        let hmac_part: [u8; HMAC_SIZE] =
-                            (&buffer[self.block_size as usize..]).try_into().unwrap();
+                        let hmac_part: [u8; HMAC_SIZE] = (&buffer
+                            [self.block_size as usize..])
+                            .try_into()
+                            .unwrap();
 
-                        let segment_hash: [u8; HMAC_SIZE] = self.hmac.clone().finalize_fixed().into();
-                        let expected_hash =
-                            self.hashes_reversed.pop().ok_or(ScrombleError::FileChanged)?;
-                        if !bool::from(segment_hash.as_slice().ct_eq(&expected_hash))
-                        {
+                        let segment_hash: [u8; HMAC_SIZE] =
+                            self.hmac.clone().finalize_fixed().into();
+                        let expected_hash = self
+                            .hashes_reversed
+                            .pop()
+                            .ok_or(ScrombleError::FileChanged)?;
+                        if !bool::from(
+                            segment_hash.as_slice().ct_eq(&expected_hash),
+                        ) {
                             return Err(ScrombleError::FileChanged.into());
                         }
 
-                        self.inner_buffer[..HMAC_SIZE].copy_from_slice(&hmac_part);
+                        self.inner_buffer[..HMAC_SIZE]
+                            .copy_from_slice(&hmac_part);
                         self.bytes_in_buffer = HMAC_SIZE as u64;
 
                         buffer.resize(self.block_size as usize, 0);
@@ -797,7 +931,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
         }
 
         assert!(self.bytes_in_buffer >= HMAC_SIZE as u64);
-        self.hmac.update(&buffer[..self.bytes_in_buffer as usize - HMAC_SIZE]);
+        self.hmac
+            .update(&buffer[..self.bytes_in_buffer as usize - HMAC_SIZE]);
 
         let final_mac = self.hmac.clone().finalize_fixed();
         // can be an unwrap()
@@ -806,17 +941,19 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
             .pop()
             .ok_or(ScrombleError::FileChanged)?;
 
-        if !<bool>::from(final_mac.as_slice().ct_eq(final_hash.as_slice())) {
-            return Err(ScrombleError::FileChanged.into());
-        }
-
-        if !<bool>::from(final_mac.as_slice()
-            .ct_eq(&buffer[self.bytes_in_buffer as usize - HMAC_SIZE..self.bytes_in_buffer as usize]))
+        if !<bool>::from(final_mac.as_slice().ct_eq(final_hash.as_slice()))
         {
             return Err(ScrombleError::FileChanged.into());
         }
 
-        buffer.resize(self.bytes_in_buffer as usize - HMAC_SIZE,0);
+        if !<bool>::from(final_mac.as_slice().ct_eq(
+            &buffer[self.bytes_in_buffer as usize - HMAC_SIZE
+                ..self.bytes_in_buffer as usize],
+        )) {
+            return Err(ScrombleError::FileChanged.into());
+        }
+
+        buffer.resize(self.bytes_in_buffer as usize - HMAC_SIZE, 0);
         Ok(Some(buffer))
     }
 }
@@ -844,11 +981,13 @@ where
         Nonce(ret.into())
     };
 
-    let (cipher, mac_state) = RootKey::new(pw, &salt).create_states(nonce.clone());
+    let (cipher, mac_state) =
+        RootKey::new(pw, &salt).create_states(nonce.clone());
 
     reader.rewind()?;
 
-    let (mut mac_table,total_size,mut last_8) = HmacTable::new(mac_state, reader)?;
+    let (mut mac_table, total_size, mut last_8) =
+        HmacTable::new(mac_state, reader)?;
     let mut cipher = cipher;
 
     let mut buf = vec![];
@@ -860,15 +999,16 @@ where
 
         let output_slice: &mut [u8] = if is_first {
             is_first = false;
-            if &buf[..64] != &salt.0 || &buf[64..88] != nonce.0.as_slice() {
+            if &buf[..64] != &salt.0 || &buf[64..88] != nonce.0.as_slice()
+            {
                 return Err(ScrombleError::FileChanged.into());
             }
 
             {
-                cipher.try_seek(total_size-128-64-8)?;
+                cipher.try_seek(total_size - 128 - 64 - 8)?;
                 cipher.try_apply_keystream(&mut last_8).unwrap();
                 correct_size = u64::from_le_bytes(last_8);
-                assert!(correct_size <= total_size-128-64-8);
+                assert!(correct_size <= total_size - 128 - 64 - 8);
                 cipher.try_seek(0u64)?;
             }
 
@@ -877,8 +1017,10 @@ where
             &mut buf
         };
 
-        let amount_to_write = min(output_slice.len(),correct_size as usize-bytes_written);
-        cipher.try_apply_keystream(&mut output_slice[..amount_to_write])?;
+        let amount_to_write =
+            min(output_slice.len(), correct_size as usize - bytes_written);
+        cipher
+            .try_apply_keystream(&mut output_slice[..amount_to_write])?;
         writer.write_all(&output_slice[..amount_to_write])?;
         bytes_written += amount_to_write;
     }
@@ -894,7 +1036,7 @@ mod test {
     use quickcheck::Arbitrary;
     use quickcheck_macros::quickcheck;
 
-    #[derive(Debug,Clone)]
+    #[derive(Debug, Clone)]
     struct ScrombleFile {
         pw: String,
         max_pad_factor: Option<f32>,
@@ -905,7 +1047,7 @@ mod test {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
             let pw = String::arbitrary(g).into();
             let max_pad_factor = if bool::arbitrary(g) {
-                Some((u16::arbitrary(g) as f32)/(u16::MAX as f32))
+                Some((u16::arbitrary(g) as f32) / (u16::MAX as f32))
             } else {
                 None
             };
@@ -918,74 +1060,143 @@ mod test {
         }
 
         fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-            Box::new(self.plaintext.shrink()
-                .map({ let zelf = self.clone();
-                    move |plaintext|
-                    Self {
-                        pw: zelf.pw.clone(),
-                        max_pad_factor: zelf.max_pad_factor.clone(),
-                        plaintext } })
-                .chain(self.max_pad_factor.shrink()
-                    .map({ let zelf = self.clone();
-                        move |max_pad_factor|
-                        Self {
+            Box::new(
+                self.plaintext
+                    .shrink()
+                    .map({
+                        let zelf = self.clone();
+                        move |plaintext| Self {
+                            pw: zelf.pw.clone(),
+                            max_pad_factor: zelf.max_pad_factor.clone(),
+                            plaintext,
+                        }
+                    })
+                    .chain(self.max_pad_factor.shrink().map({
+                        let zelf = self.clone();
+                        move |max_pad_factor| Self {
                             pw: zelf.pw.clone(),
                             max_pad_factor,
-                            plaintext: zelf.plaintext.clone() } }))
-                .chain(self.pw.shrink()
-                    .map({ let zelf = self.clone();
-                        move |pw|
-                        Self { pw,
+                            plaintext: zelf.plaintext.clone(),
+                        }
+                    }))
+                    .chain(self.pw.shrink().map({
+                        let zelf = self.clone();
+                        move |pw| Self {
+                            pw,
                             max_pad_factor: zelf.max_pad_factor.clone(),
-                            plaintext: zelf.plaintext.clone() } })))
+                            plaintext: zelf.plaintext.clone(),
+                        }
+                    })),
+            )
         }
     }
 
     #[quickcheck]
     fn enc_dec_loop(file: ScrombleFile) {
         let mut enc_file = vec![];
-        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file)).unwrap();
+        scromble(
+            Passphrase(file.pw.clone().into()),
+            file.max_pad_factor,
+            Box::new(&file.plaintext[..]),
+            Box::new(&mut enc_file),
+        )
+        .unwrap();
         let enc_file_len = enc_file.len() as f32;
         let max_pad_factor = file.max_pad_factor.unwrap_or(1.0f32);
-        let enc_file_len_limit = (1f32 + max_pad_factor)*(file.plaintext.len() as f32) + (4*64 + 8) as f32;
-        assert!(enc_file_len <= enc_file_len_limit,"{} <= {}",enc_file_len,enc_file_len_limit);
+        let enc_file_len_limit = (1f32 + max_pad_factor)
+            * (file.plaintext.len() as f32)
+            + (4 * 64 + 8) as f32;
+        assert!(
+            enc_file_len <= enc_file_len_limit,
+            "{} <= {}",
+            enc_file_len,
+            enc_file_len_limit
+        );
         let mut dec_file = vec![];
-        descromble(Passphrase(file.pw.into()), Box::new(std::io::Cursor::new(&enc_file)), Box::new(&mut dec_file)).unwrap();
-        assert_eq!(file.plaintext,dec_file);
+        descromble(
+            Passphrase(file.pw.into()),
+            Box::new(std::io::Cursor::new(&enc_file)),
+            Box::new(&mut dec_file),
+        )
+        .unwrap();
+        assert_eq!(file.plaintext, dec_file);
     }
 
     #[quickcheck]
-    fn decrypt_authentic(corruption_mask: (u8,Vec<u8>), corruption_pos: u16, file: ScrombleFile) {
+    fn decrypt_authentic(
+        corruption_mask: (u8, Vec<u8>),
+        corruption_pos: u16,
+        file: ScrombleFile,
+    ) {
         let mut enc_file = vec![];
-        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file)).unwrap();
+        scromble(
+            Passphrase(file.pw.clone().into()),
+            file.max_pad_factor,
+            Box::new(&file.plaintext[..]),
+            Box::new(&mut enc_file),
+        )
+        .unwrap();
 
         let corruption_pos = (corruption_pos as usize) % enc_file.len();
-        for (i,x) in core::iter::once(corruption_mask.0).chain((corruption_mask.1).into_iter()).enumerate() {
-            let ix = corruption_pos+i;
-            if ix >= enc_file.len() { break; }
-            enc_file[corruption_pos+i] ^= x;
+        for (i, x) in core::iter::once(corruption_mask.0)
+            .chain((corruption_mask.1).into_iter())
+            .enumerate()
+        {
+            let ix = corruption_pos + i;
+            if ix >= enc_file.len() {
+                break;
+            }
+            enc_file[corruption_pos + i] ^= x;
         }
 
         let mut dec_file = vec![];
-        descromble(Passphrase(file.pw.into()), Box::new(std::io::Cursor::new(&enc_file)), Box::new(&mut dec_file)).unwrap_err();
+        descromble(
+            Passphrase(file.pw.into()),
+            Box::new(std::io::Cursor::new(&enc_file)),
+            Box::new(&mut dec_file),
+        )
+        .unwrap_err();
     }
 
     #[quickcheck]
     fn decrypt_wrong_pw(wrong_pw: String, file: ScrombleFile) {
         let mut enc_file = vec![];
-        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file)).unwrap();
+        scromble(
+            Passphrase(file.pw.clone().into()),
+            file.max_pad_factor,
+            Box::new(&file.plaintext[..]),
+            Box::new(&mut enc_file),
+        )
+        .unwrap();
 
         let mut dec_file = vec![];
-        descromble(Passphrase(wrong_pw.into()), Box::new(std::io::Cursor::new(&enc_file)), Box::new(&mut dec_file)).unwrap_err();
+        descromble(
+            Passphrase(wrong_pw.into()),
+            Box::new(std::io::Cursor::new(&enc_file)),
+            Box::new(&mut dec_file),
+        )
+        .unwrap_err();
     }
 
     // TODO: come up with better statistical tests
     #[quickcheck]
     fn encrypt_uncorrelated(file: ScrombleFile) {
         let mut enc_file1 = vec![];
-        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file1)).unwrap();
+        scromble(
+            Passphrase(file.pw.clone().into()),
+            file.max_pad_factor,
+            Box::new(&file.plaintext[..]),
+            Box::new(&mut enc_file1),
+        )
+        .unwrap();
         let mut enc_file2 = vec![];
-        scromble(Passphrase(file.pw.clone().into()), file.max_pad_factor, Box::new(&file.plaintext[..]), Box::new(&mut enc_file2)).unwrap();
+        scromble(
+            Passphrase(file.pw.clone().into()),
+            file.max_pad_factor,
+            Box::new(&file.plaintext[..]),
+            Box::new(&mut enc_file2),
+        )
+        .unwrap();
 
         assert!(enc_file1.len() < u32::MAX as usize);
 
@@ -996,11 +1207,12 @@ mod test {
         let mut hist_diff = [0usize; 256];
         let mut hist_diff_samples = 0usize;
 
-        for i in 0..max(enc_file1.len(),enc_file2.len()) {
+        for i in 0..max(enc_file1.len(), enc_file2.len()) {
             if i < enc_file1.len() {
                 if i < enc_file2.len() {
                     hist_diff_samples += 1;
-                    hist_diff[enc_file1[i].wrapping_sub(enc_file2[i]) as usize] += 1;
+                    hist_diff[enc_file1[i].wrapping_sub(enc_file2[i])
+                        as usize] += 1;
                 }
 
                 hist1_samples += 1;
@@ -1013,17 +1225,20 @@ mod test {
             }
         }
 
-        let hists = vec![(hist1_samples, hist1), (hist2_samples, hist2),
-            (hist_diff_samples, hist_diff)];
+        let hists = vec![
+            (hist1_samples, hist1),
+            (hist2_samples, hist2),
+            (hist_diff_samples, hist_diff),
+        ];
 
-        for (i,(n,hist)) in hists.into_iter().enumerate() {
+        for (i, (n, hist)) in hists.into_iter().enumerate() {
             assert!(n > 0);
             let mut ent = 0f64;
             for c in hist {
-                let p = (c as f64)/(n as f64);
+                let p = (c as f64) / (n as f64);
                 let lg_p = p.log2();
                 if lg_p.is_finite() {
-                    ent += -(p*lg_p/8f64);
+                    ent += -(p * lg_p / 8f64);
                 }
             }
 
@@ -1107,21 +1322,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
 
-        Command::GenCompletion { which_shell: None, .. } => {
+        Command::GenCompletion {
+            which_shell: None, ..
+        } => {
             for x in Shell::value_variants() {
                 println!("{x}");
             }
             return Ok(());
         }
 
-        Command::GenCompletion { which_shell: Some(shell), outdir } => {
-            let shell = Shell::from_str(shell,true)?;
+        Command::GenCompletion {
+            which_shell: Some(shell),
+            outdir,
+        } => {
+            let shell = Shell::from_str(shell, true)?;
             match outdir {
                 None => {
-                    generate(shell,&mut Command::clap(), "scromble", &mut std::io::stdout());
+                    generate(
+                        shell,
+                        &mut Command::clap(),
+                        "scromble",
+                        &mut std::io::stdout(),
+                    );
                 }
                 Some(outdir) => {
-                    generate_to(shell,&mut Command::clap(), "scromble", outdir)?;
+                    generate_to(
+                        shell,
+                        &mut Command::clap(),
+                        "scromble",
+                        outdir,
+                    )?;
                 }
             }
             return Ok(());
@@ -1130,21 +1360,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
-
     let password = Passphrase(rpassword::read_password()?.into());
 
     let stdout = std::io::stdout();
-    let open_outfile = |outfile: _| -> Result<Box<dyn Write>, std::io::Error> {
-        #[cfg(target_os = "windows")]
-        let outfile = Some(outfile);
+    let open_outfile =
+        |outfile: _| -> Result<Box<dyn Write>, std::io::Error> {
+            #[cfg(target_os = "windows")]
+            let outfile = Some(outfile);
 
-        let ret: Box<dyn Write> = if let Some(outfile) = outfile {
-            Box::new(File::create(outfile)?) as Box<dyn Write>
-        } else {
-            Box::new(stdout.lock()) as Box<dyn Write>
+            let ret: Box<dyn Write> = if let Some(outfile) = outfile {
+                Box::new(File::create(outfile)?) as Box<dyn Write>
+            } else {
+                Box::new(stdout.lock()) as Box<dyn Write>
+            };
+            Ok(ret)
         };
-        Ok(ret)
-    };
 
     match args {
         Command::Encrypt {
@@ -1161,7 +1391,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Decrypt { file, outfile } => {
-            descromble(password, Box::new(File::open(&file)?), open_outfile(outfile)?)?;
+            descromble(
+                password,
+                Box::new(File::open(&file)?),
+                open_outfile(outfile)?,
+            )?;
         }
 
         _ => {
@@ -1170,4 +1404,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
-
