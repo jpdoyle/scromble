@@ -6,14 +6,15 @@ extern crate quickcheck_macros;
 use core::cmp::{min,max};
 use secrecy::{SecretString,ExposeSecret,SecretBox};
 use std::path::PathBuf;
-use structopt::StructOpt;
-// use zeroize::Zeroizing;
+use clap::{StructOpt,ValueEnum};
+use clap_complete::{
+    generate,generate_to,
+    Shell
+};
 use blake2::Blake2bMac;
 use rand_chacha::ChaCha20Rng;
-// use cipher::{StreamCipher,StreamCipherSeek};
 use typenum::{IsLessOrEqual,LeEq,consts::{U32,U64},NonZero};
 use rand::{SeedableRng,RngCore};
-// use std::convert::TryInto;
 use std::fmt;
 use std::fs::File;
 use std::io::Seek;
@@ -1031,7 +1032,7 @@ mod test {
     }
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, clap::StructOpt)]
 #[structopt(name = "scromble",
 about = concat!(
 "Symmetric, randomized, authenticated encryption/decryption\n\n",
@@ -1041,7 +1042,6 @@ about = concat!(
 "Run with `explain-design` for more details\n\n",
 )
 )]
-#[allow(dead_code)]
 enum Command {
     /// Encrypt and MAC with fresh randomness.
     Encrypt {
@@ -1078,7 +1078,7 @@ enum Command {
     },
 
     /// Print the `scromble` DESIGN.md document.
-    ExplainDesign {},
+    ExplainDesign,
 
     /// Generate a shell completion file.
     GenCompletion {
@@ -1088,7 +1088,7 @@ enum Command {
 
         /// Where to put the completions
         #[structopt(parse(from_os_str))]
-        outfile: Option<PathBuf>,
+        outdir: Option<PathBuf>,
     },
 }
 
@@ -1099,6 +1099,38 @@ enum Command {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Command::from_args();
+
+    match &args {
+        Command::ExplainDesign => {
+            let design_str = include_str!("../DESIGN.md");
+            print!("{design_str}");
+            return Ok(());
+        }
+
+        Command::GenCompletion { which_shell: None, .. } => {
+            for x in Shell::value_variants() {
+                println!("{x}");
+            }
+            return Ok(());
+        }
+
+        Command::GenCompletion { which_shell: Some(shell), outdir } => {
+            let shell = Shell::from_str(shell,true)?;
+            match outdir {
+                None => {
+                    generate(shell,&mut Command::clap(), "scromble", &mut std::io::stdout());
+                }
+                Some(outdir) => {
+                    generate_to(shell,&mut Command::clap(), "scromble", outdir)?;
+                }
+            }
+            return Ok(());
+        }
+
+        _ => {}
+    }
+
+
     let password = Passphrase(rpassword::read_password()?.into());
 
     let stdout = std::io::stdout();
@@ -1138,3 +1170,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
