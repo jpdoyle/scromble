@@ -89,6 +89,7 @@ mod chacha {
         [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
     /// The ChaCha20 quarter round function
+    #[inline(always)]
     fn quarter_round(
         a: usize,
         b: usize,
@@ -286,6 +287,9 @@ mod chacha {
             let mut offset = self.offset;
             let mut block_ix = self.block_ix;
 
+            let key = self.key.expose_secret();
+            let nonce = self.nonce.expose_secret();
+
             if offset > 0 {
                 let num_bytes = min(buffer.len(), 64 - (offset as usize));
                 let mut block = [0u8; 64];
@@ -294,8 +298,8 @@ mod chacha {
                     .copy_from_slice(&buffer[..num_bytes]);
 
                 chacha20_apply_block(
-                    self.key.expose_secret(),
-                    self.nonce.expose_secret(),
+                    key,
+                    nonce,
                     block_ix,
                     &mut block,
                 );
@@ -326,8 +330,8 @@ mod chacha {
                 block[..].copy_from_slice(&buffer[..64]);
 
                 chacha20_apply_block(
-                    self.key.expose_secret(),
-                    self.nonce.expose_secret(),
+                    key,
+                    nonce,
                     block_ix,
                     &mut block,
                 );
@@ -349,8 +353,8 @@ mod chacha {
                 block[..buffer.len()].copy_from_slice(&buffer[..]);
 
                 chacha20_apply_block(
-                    self.key.expose_secret(),
-                    self.nonce.expose_secret(),
+                    key,
+                    nonce,
                     block_ix,
                     &mut block,
                 );
