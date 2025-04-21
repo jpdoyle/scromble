@@ -4,13 +4,13 @@
 extern crate quickcheck_macros;
 
 use core::cmp::{min,max};
-use secrecy::{Secret,SecretString,ExposeSecret};
+use secrecy::{SecretString,ExposeSecret,SecretBox};
 use std::path::PathBuf;
 use structopt::StructOpt;
 // use zeroize::Zeroizing;
 use blake2::Blake2bMac;
 use rand_chacha::ChaCha20Rng;
-use cipher::{StreamCipher,StreamCipherSeek};
+// use cipher::{StreamCipher,StreamCipherSeek};
 use typenum::{IsLessOrEqual,LeEq,consts::{U32,U64},NonZero};
 use rand::{SeedableRng,RngCore};
 // use std::convert::TryInto;
@@ -24,6 +24,394 @@ use subtle::ConstantTimeEq;
 use digest::{FixedOutput,Mac};
 use conv::ApproxFrom;
 use std::convert::TryInto;
+
+enum ScrombleError {
+    TooShort,
+    BadHmac,
+    FileChanged,
+    Overflow,
+}
+
+impl fmt::Display for ScrombleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScrombleError::TooShort => {
+                write!(f, "File is too short to be a valid scromble file")
+            }
+            ScrombleError::BadHmac => {
+                write!(f, "Ciphertext has an invalid HMAC")
+            }
+            ScrombleError::FileChanged => {
+                write!(f, "File contents changed while decrypting")
+            }
+            ScrombleError::Overflow => {
+                write!(f, "An integer overflow occurred")
+            }
+        }
+    }
+}
+
+impl fmt::Debug for ScrombleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (&self as &dyn fmt::Display).fmt(f)
+    }
+}
+
+impl std::error::Error for ScrombleError {}
+
+
+///// begin unfortunate vendored XChaCha20 impl //////
+
+mod chacha {
+    use super::*;
+
+    use zeroize::{DefaultIsZeroes};//,Zeroize};//,ZeroizeOnDrop};
+
+    #[derive(Default,Clone,Copy)]
+    struct ChaChaKey(pub [u32;8]);
+    impl DefaultIsZeroes for ChaChaKey {}
+
+    #[derive(Default,Clone,Copy)]
+    struct ChaChaState(pub [u32;16]);
+    impl DefaultIsZeroes for ChaChaState {}
+
+    #[derive(Default,Clone,Copy)]
+    struct ChaChaNonce(pub [u32;2]);
+    impl DefaultIsZeroes for ChaChaNonce {}
+
+    #[derive(Default,Clone,Copy)]
+    struct HChaChaNonce(pub [u32;4]);
+    impl zeroize::DefaultIsZeroes for HChaChaNonce {}
+
+    /// State initialization constant ("expand 32-byte k")
+
+    const CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
+
+    /// The ChaCha20 quarter round function
+    fn quarter_round(a: usize, b: usize, c: usize, d: usize, state: &mut ChaChaState) {
+        state.0[a] = state.0[a].wrapping_add(state.0[b]);
+        state.0[d] ^= state.0[a];
+        state.0[d] = state.0[d].rotate_left(16);
+
+        state.0[c] = state.0[c].wrapping_add(state.0[d]);
+        state.0[b] ^= state.0[c];
+        state.0[b] = state.0[b].rotate_left(12);
+
+        state.0[a] = state.0[a].wrapping_add(state.0[b]);
+        state.0[d] ^= state.0[a];
+        state.0[d] = state.0[d].rotate_left(8);
+
+        state.0[c] = state.0[c].wrapping_add(state.0[d]);
+        state.0[b] ^= state.0[c];
+        state.0[b] = state.0[b].rotate_left(7);
+    }
+
+    #[inline(always)]
+    fn run_rounds_inner(double_rounds: usize, res: &mut ChaChaState) {
+        for _ in 0..double_rounds {
+            // column rounds
+            quarter_round(0, 4, 8, 12, res);
+            quarter_round(1, 5, 9, 13, res);
+            quarter_round(2, 6, 10, 14, res);
+            quarter_round(3, 7, 11, 15, res);
+
+            // diagonal rounds
+            quarter_round(0, 5, 10, 15, res);
+            quarter_round(1, 6, 11, 12, res);
+            quarter_round(2, 7, 8, 13, res);
+            quarter_round(3, 4, 9, 14, res);
+        }
+    }
+
+    #[inline(always)]
+    fn run_rounds(double_rounds: usize, state: &ChaChaState) -> ChaChaState {
+        let mut res = *state;
+
+        run_rounds_inner(double_rounds, &mut res);
+
+        for (s1, s0) in res.0.iter_mut().zip(state.0.iter()) {
+            *s1 = s1.wrapping_add(*s0);
+        }
+        res
+    }
+
+    /// The HChaCha function: adapts the ChaCha core function in the same
+    /// manner that HSalsa adapts the Salsa function.
+    ///
+    /// HChaCha takes 384 bits of input:
+    ///
+    /// - Key: `u32` x 8
+    /// - Nonce: `u32` x 4
+    ///
+    /// It produces 256-bits of output suitable for use as a ChaCha key
+    ///
+    /// For more information on HSalsa on which HChaCha is based, see:
+    ///
+    /// <http://cr.yp.to/snuffle/xsalsa-20110204.pdf>
+    fn hchacha(key: ChaChaKey, nonce: HChaChaNonce) -> ChaChaKey {
+        let mut state = ChaChaState::default();
+        state.0[..4].copy_from_slice(&CONSTANTS);
+
+        state.0[ 4..12].copy_from_slice(&key.0[..]);
+        state.0[12..16].copy_from_slice(&nonce.0[..]);
+
+        run_rounds_inner(10, &mut state);
+
+        let mut output = ChaChaKey::default();
+
+        output.0[0..4].copy_from_slice(&state.0[..4]);
+        output.0[4..8].copy_from_slice(&state.0[12..16]);
+
+        output
+    }
+
+    fn chacha20_apply_block(key: &ChaChaKey, nonce: &ChaChaNonce, block_ix: u64, pt: &mut [u8; 64]) {
+        let mut state = ChaChaState::default();
+        state.0[..4].copy_from_slice(&CONSTANTS);
+
+        state.0[4..12].copy_from_slice(&key.0[..]);
+
+        state.0[12] = (block_ix & 0xffff_ffff) as u32;
+        state.0[13] = ((block_ix>>32) & 0xffff_ffff) as u32;
+        state.0[14] = nonce.0[0];
+        state.0[15] = nonce.0[1];
+
+        state = run_rounds(10,&state);
+
+        for (b, mask) in pt.iter_mut().zip(state.0.iter().flat_map(|x| x.to_le_bytes())) {
+            *b ^= mask;
+        }
+    }
+
+
+    pub struct CipherState {
+        key: SecretBox<ChaChaKey>,
+        nonce: SecretBox<ChaChaNonce>,
+        block_ix: u64,
+        offset: u8,
+    }
+
+    impl CipherState {
+        pub fn new(key_bytes: &[u8;32], nonce_bytes: &[u8;24]) -> Self {
+            let nonce = SecretBox::<ChaChaNonce>::init_with_mut(|n| {
+                n.0[0] = u32::from_le_bytes(nonce_bytes[16..20].try_into().unwrap());
+                n.0[1] = u32::from_le_bytes(nonce_bytes[20..24].try_into().unwrap());
+            });
+            let key = SecretBox::<ChaChaKey>::init_with_mut(|k| {
+                for (k,val) in k.0.iter_mut()
+                                .zip(key_bytes.chunks_exact(4)
+                                                 .map(|b| b.try_into().unwrap())
+                                                 .map(u32::from_le_bytes)) {
+                    *k = val;
+                }
+
+                let nonce: HChaChaNonce = HChaChaNonce([
+                    u32::from_le_bytes(nonce_bytes[ 0.. 4].try_into().unwrap()),
+                    u32::from_le_bytes(nonce_bytes[ 4.. 8].try_into().unwrap()),
+                    u32::from_le_bytes(nonce_bytes[ 8..12].try_into().unwrap()),
+                    u32::from_le_bytes(nonce_bytes[12..16].try_into().unwrap()),
+                ]);
+
+                *k = hchacha(*k, nonce);
+            });
+
+            Self {
+                key, nonce, block_ix: 0, offset: 0
+            }
+        }
+
+        pub fn try_seek<U: Into<u128>>(&mut self, pos: U) -> Result<(),ScrombleError> {
+            let pos: u128 = pos.into();
+            let offset = (pos&0x3F) as u8;
+            let block_ix: u64 = (pos>>6).try_into().map_err(|_| ScrombleError::Overflow)?;
+            self.block_ix = block_ix;
+            self.offset = offset;
+            Ok(())
+        }
+
+        pub fn try_apply_keystream(&mut self, mut buffer: &mut [u8]) -> Result<(),ScrombleError> {
+            let final_pos: u128 = ((self.block_ix as u128)*64 + (self.offset as u128)).saturating_add(buffer.len() as u128);
+            if final_pos > (1u128<<(64+6)) {
+                return Err(ScrombleError::Overflow);
+            }
+
+            if buffer.len() == 0 {
+                return Ok(());
+            }
+
+            let mut offset = self.offset;
+            let mut block_ix = self.block_ix;
+
+            if offset > 0 {
+                let num_bytes = min(buffer.len(), 64-(offset as usize));
+                let mut block = [0u8; 64];
+                let off = offset as usize;
+                block[off..off+num_bytes].copy_from_slice(&buffer[..num_bytes]);
+
+                chacha20_apply_block(self.key.expose_secret(), self.nonce.expose_secret(), block_ix, &mut block);
+
+                buffer[..num_bytes].copy_from_slice(&block[off..off+num_bytes]);
+
+                offset += num_bytes as u8;
+                buffer = &mut buffer[num_bytes..];
+            }
+
+            if offset == 64 {
+                match block_ix.checked_add(1) {
+                    Some(new_ix) => {
+                        offset = 0;
+                        block_ix = new_ix;
+                    }
+                    None => {
+                        assert!(buffer.len() == 0);
+                    }
+                }
+            }
+
+            while buffer.len() >= 64 {
+                assert_eq!(offset,0);
+
+                let mut block = [0u8; 64];
+                block[..].copy_from_slice(&buffer[..64]);
+
+                chacha20_apply_block(self.key.expose_secret(), self.nonce.expose_secret(), block_ix, &mut block);
+
+                buffer[..64].copy_from_slice(&block[..]);
+
+                block_ix = block_ix.checked_add(1).ok_or(ScrombleError::Overflow)?;
+
+                buffer = &mut buffer[64..];
+            }
+
+            if buffer.len() > 0 {
+                assert!(buffer.len() <= 63);
+                assert_eq!(offset, 0);
+
+                let mut block = [0u8; 64];
+                block[..buffer.len()].copy_from_slice(&buffer[..]);
+
+                chacha20_apply_block(self.key.expose_secret(), self.nonce.expose_secret(), block_ix, &mut block);
+
+                let buflen = buffer.len();
+                buffer[..].copy_from_slice(&block[..buflen]);
+
+                offset = buffer.len() as u8;
+            }
+
+            self.block_ix = block_ix;
+            self.offset = offset;
+
+            return Ok(());
+        }
+    }
+
+    #[cfg(test)]
+    mod chacha20_tests {
+        use super::*;
+
+        #[test]
+        fn chacha_known_answer() {
+            let mut state = CipherState {
+                key: SecretBox::new(Box::new(ChaChaKey::default())),
+                nonce: SecretBox::new(Box::new(ChaChaNonce::default())),
+                block_ix: 0,
+                offset: 0,
+            };
+
+            let mut expected_answer = [
+                0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90, 0x40, 0x5d,
+                0x6a, 0xe5, 0x53, 0x86, 0xbd, 0x28, 0xbd, 0xd2, 0x19, 0xb8,
+                0xa0, 0x8d, 0xed, 0x1a, 0xa8, 0x36, 0xef, 0xcc, 0x8b, 0x77,
+                0x0d, 0xc7, 0xda, 0x41, 0x59, 0x7c, 0x51, 0x57, 0x48, 0x8d,
+                0x77, 0x24, 0xe0, 0x3f, 0xb8, 0xd8, 0x4a, 0x37, 0x6a, 0x43,
+                0xb8, 0xf4, 0x15, 0x18, 0xa1, 0x1c, 0xc3, 0x87, 0xb6, 0x69,
+                0xb2, 0xee, 0x65, 0x86];
+
+            state.try_apply_keystream(&mut expected_answer[..]).unwrap();
+            let mut i = 0;
+            for x in expected_answer {
+                assert_eq!(x,0,"{}",i);
+                i += 1;
+            }
+        }
+
+        #[test]
+        fn xchacha_known_answer() {
+            let key = [
+                0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+                0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93,
+                0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d,
+                0x9e, 0x9f,
+            ];
+            let nonce = [
+                0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+                0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53,
+                0x54, 0x55, 0x56, 0x58,
+            ];
+            let mut state = CipherState::new(&key,&nonce);
+
+            let mut expected_answers = [
+                vec![
+                    0x29, 0x62, 0x4b, 0x4b, 0x1b, 0x14, 0x0a, 0xce, 0x53, 0x74,
+                    0x0e, 0x40, 0x5b, 0x21, 0x68
+                ],
+                vec![ 0x54, 0x0f ],
+            ];
+
+            state.try_seek(64u64).unwrap();
+            let mut i = 0;
+            for expected_answer in expected_answers.iter_mut() {
+                state.try_apply_keystream(&mut expected_answer[..]).unwrap();
+                for x in expected_answer {
+                    assert_eq!(*x,0,"{}",i);
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod hchacha20_tests {
+        use super::*;
+
+        //
+        // Test vectors from:
+        // https://tools.ietf.org/id/draft-arciszewski-xchacha-03.html#rfc.section.2.2.1
+        //
+
+        const KEY: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ];
+
+        const INPUT: [u8; 16] = [
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00, 0x31, 0x41, 0x59,
+            0x27,
+        ];
+
+        const OUTPUT: [u8; 32] = [
+            0x82, 0x41, 0x3b, 0x42, 0x27, 0xb2, 0x7b, 0xfe, 0xd3, 0xe, 0x42, 0x50, 0x8a, 0x87, 0x7d,
+            0x73, 0xa0, 0xf9, 0xe4, 0xd5, 0x8a, 0x74, 0xa8, 0x53, 0xc1, 0x2e, 0xc4, 0x13, 0x26, 0xd3,
+            0xec, 0xdc,
+        ];
+
+        #[test]
+        fn test_vector() {
+            let key: [u32;8] = KEY.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>().try_into().unwrap();
+            let nonce: [u32;4] = INPUT.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>().try_into().unwrap();
+            let output: [u32;8] = OUTPUT.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>().try_into().unwrap();
+            let actual = hchacha(
+                ChaChaKey(key),
+                HChaChaNonce(nonce),
+            );
+            assert_eq!(actual.0, output);
+        }
+    }
+
+}
+
+///// end   unfortunate vendored XChaCha20 impl //////
 
 fn argon2i_config() -> argon2::Params {
     argon2::Params::new(1 << 14, 1, 2, Some(64)).unwrap()
@@ -47,11 +435,20 @@ where
 }
 
 // struct RootKey(Zeroizing<Secret<[u8; 64]>>);
-struct RootKey(Secret<[u8; 64]>);
+#[derive(Clone,Copy)]
+struct RootKeyInner([u8; 64]);
+impl Default for RootKeyInner {
+    fn default() -> Self {
+        Self([0u8;64])
+    }
+}
+impl zeroize::DefaultIsZeroes for RootKeyInner {}
+struct RootKey(SecretBox<RootKeyInner>);
 
 struct Passphrase(SecretString);
 #[derive(Clone)]
-struct Nonce(chacha20::XNonce);
+// struct Nonce(chacha20::XNonce);
+struct Nonce([u8;24]);
 #[derive(Clone)]
 struct NonceBlock(Nonce, [u8; 40]);
 struct Salt([u8; 64]);
@@ -59,7 +456,7 @@ struct Salt([u8; 64]);
 // TODO: figure out how to zeroize these and pin them in place.
 //       It isn't obvious that we can even pin all these.
 type HmacState = Box<Blake2bMac<U64>>;
-type CipherState = Box<chacha20::XChaCha20>;
+// type CipherState = Box<chacha20::XChaCha20>;
 
 impl RootKey {
     fn new(pass: Passphrase, salt: &Salt) -> Self {
@@ -97,22 +494,27 @@ impl RootKey {
             hash_with_tag(a2id, "argon2id")
         };
 
-        Self(Secret::new(key2b::<U64>(
-            &[0u8; 64],
-            &["root".as_bytes(), &rk_i, &rk_id],
-        ).into()))
+        Self(SecretBox::<RootKeyInner>::init_with_mut(|rk|
+            rk.0.copy_from_slice(key2b::<U64>(
+                &[0u8; 64],
+                &["root".as_bytes(), &rk_i, &rk_id],
+            ).as_slice())
+        ))
     }
 
-    fn create_states(self, nonce: Nonce) -> (CipherState, HmacState) {
-        let hmac_key = key2b::<U64>(self.0.expose_secret(), &["hmac".as_bytes()]);
+    fn create_states(self, nonce: Nonce) -> (Box<chacha::CipherState>, HmacState) {
+        let hmac_key = key2b::<U64>(&self.0.expose_secret().0, &["hmac".as_bytes()]);
         let hmac = Box::new(Blake2bMac::new_with_salt_and_personal(
             &hmac_key,
             &[],
             "sCrOmB2AuThEnTiC".as_bytes(),
         ).unwrap());
-        let cipher_key = key2b::<U32>(self.0.expose_secret(), &["encrypt".as_bytes()]);
-        let cipher = Box::new(<chacha20::XChaCha20 as cipher::KeyIvInit>::new(
-            &cipher_key,
+        let cipher_key = key2b::<U32>(&self.0.expose_secret().0, &["encrypt".as_bytes()]);
+
+        // let cipher = Box::new(<chacha20::XChaCha20 as cipher::KeyIvInit>::new(
+
+        let cipher = Box::new(chacha::CipherState::new(
+            &<[u8;32]>::from(cipher_key),
             &nonce.0,
         ));
         (cipher, hmac)
@@ -142,7 +544,8 @@ where
         prng.fill_bytes(&mut nonce_buf);
         prng.fill_bytes(&mut rest_buf);
 
-        NonceBlock(Nonce(chacha20::XNonce::clone_from_slice(&nonce_buf)), rest_buf)
+        // NonceBlock(Nonce(chacha20::XNonce::clone_from_slice(&nonce_buf)), rest_buf)
+        NonceBlock(Nonce(nonce_buf), rest_buf)
     };
 
     let (mut cipher, mut mac_state) = RootKey::new(pw, &salt).create_states(nonce.0.clone());
@@ -462,10 +865,10 @@ where
 
             {
                 cipher.try_seek(total_size-128-64-8)?;
-                cipher.apply_keystream(&mut last_8);
+                cipher.try_apply_keystream(&mut last_8).unwrap();
                 correct_size = u64::from_le_bytes(last_8);
                 assert!(correct_size <= total_size-128-64-8);
-                cipher.try_seek(0)?;
+                cipher.try_seek(0u64)?;
             }
 
             &mut buf[128..]
@@ -688,40 +1091,6 @@ enum Command {
         outfile: Option<PathBuf>,
     },
 }
-
-enum ScrombleError {
-    TooShort,
-    BadHmac,
-    FileChanged,
-    Overflow,
-}
-
-impl fmt::Display for ScrombleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ScrombleError::TooShort => {
-                write!(f, "File is too short to be a valid scromble file")
-            }
-            ScrombleError::BadHmac => {
-                write!(f, "Ciphertext has an invalid HMAC")
-            }
-            ScrombleError::FileChanged => {
-                write!(f, "File contents changed while decrypting")
-            }
-            ScrombleError::Overflow => {
-                write!(f, "An integer overflow occurred")
-            }
-        }
-    }
-}
-
-impl fmt::Debug for ScrombleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (&self as &dyn fmt::Display).fmt(f)
-    }
-}
-
-impl std::error::Error for ScrombleError {}
 
 // #[test]
 // fn all_sizes_agree() {
