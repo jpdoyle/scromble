@@ -16,7 +16,7 @@
       with pkgs;
       rec {
         devShell = mkShell {
-          buildInputs = [ cargo rustfmt clippy ];
+          buildInputs = [ cargo rustfmt clippy rustc ];
 
           RUST_BACKTRACE="full";
         };
