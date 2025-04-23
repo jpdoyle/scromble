@@ -143,10 +143,10 @@ mod chacha {
     }
 
     #[inline(always)]
-    fn run_rounds_inner<const DOUBLE_ROUNDS: usize>(res: &mut ChaChaState) {
+    fn run_rounds_inner<const DOUBLE_ROUNDS: usize>(mut res: ChaChaState) -> ChaChaState {
+        let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
+            &mut res.0;
         for _ in 0..DOUBLE_ROUNDS {
-            let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
-                &mut res.0;
 
             // column rounds
             quarter_rounds(
@@ -164,15 +164,14 @@ mod chacha {
                 [x15, x12, x13, x14],
             );
         }
+        res
     }
 
     #[inline(always)]
     fn run_rounds<const DOUBLE_ROUNDS: usize>(
         state: &ChaChaState,
     ) -> ChaChaState {
-        let mut res = *state;
-
-        run_rounds_inner::<DOUBLE_ROUNDS>(&mut res);
+        let mut res = run_rounds_inner::<DOUBLE_ROUNDS>(*state);
 
         for (s1, s0) in res.0.iter_mut().zip(state.0.iter()) {
             *s1 = s1.wrapping_add(*s0);
@@ -200,7 +199,7 @@ mod chacha {
         state.0[4..12].copy_from_slice(&key.0[..]);
         state.0[12..16].copy_from_slice(&nonce.0[..]);
 
-        run_rounds_inner::<10>(&mut state);
+        state = run_rounds_inner::<10>(state);
 
         let mut output = ChaChaKey::default();
 
