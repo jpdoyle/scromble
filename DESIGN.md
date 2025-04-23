@@ -29,7 +29,7 @@ Intended security properties
       20% for large files, see [Maximum Pad Scale](#maximum-pad-scale)) but
       can be given a custom random padding range if need be.
     - When decrypting, scromble doesn't output the padding data, so an
-      adversary can observe how big the file if you let them observe the
+      adversary can observe how big the file is if you let them observe the
       time or file system traffic totals of decryption. This kind of
       problem is basically unavoidable without implementing Oblivious RAM.
     - This helps somewhat when you have certain very specific file sizes,
@@ -263,7 +263,7 @@ bytes have been processed and the HMAC prefix containing those bytes is
 checked.
 
 To minimize the total memory overhead from the HMAC prefix table and the
-buffer required to check against it, `chunk_size` gets updated
+buffer required to check against it, `block_size` gets updated
 incrementally during the HMAC-check pass. If `hmac_prefs.len()*HMAC_LEN >=
 2*block_size` (here `HMAC_LEN == 64`), then `block_size` gets updated to
 `block_size*2` and every even entry in `hmac_prefs` gets deleted -- ie:
