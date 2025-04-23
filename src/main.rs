@@ -89,6 +89,7 @@ mod chacha {
         [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
     /// The ChaCha20 quarter round function
+    #[allow(dead_code)]
     #[inline(always)]
     fn quarter_round(
         a: usize,
@@ -114,20 +115,55 @@ mod chacha {
         state.0[b] = state.0[b].rotate_left(7);
     }
 
+    /// The ChaCha20 quarter round function
+    #[inline(always)]
+    fn quarter_rounds(
+        a: [&mut u32;4],
+        b: [&mut u32;4],
+        c: [&mut u32;4],
+        d: [&mut u32;4],
+    ) {
+        for i in 0..4 {
+            *a[i]  = a[i].wrapping_add(*b[i]);
+            *d[i] ^= *a[i];
+            *d[i]  = d[i].rotate_left(16);
+
+            *c[i]  = c[i].wrapping_add(*d[i]);
+            *b[i] ^= *c[i];
+            *b[i]  = b[i].rotate_left(12);
+
+            *a[i]  = a[i].wrapping_add(*b[i]);
+            *d[i] ^= *a[i];
+            *d[i]  = d[i].rotate_left(8);
+
+            *c[i]  = c[i].wrapping_add(*d[i]);
+            *b[i] ^= *c[i];
+            *b[i]  = b[i].rotate_left(7);
+        }
+    }
+
+
     #[inline(always)]
     fn run_rounds_inner(double_rounds: usize, res: &mut ChaChaState) {
         for _ in 0..double_rounds {
+            let [x00,x01,x02,x03,
+                 x04,x05,x06,x07,
+                 x08,x09,x10,x11,
+                 x12,x13,x14,x15] = &mut res.0;
+
             // column rounds
-            quarter_round(0, 4, 8, 12, res);
-            quarter_round(1, 5, 9, 13, res);
-            quarter_round(2, 6, 10, 14, res);
-            quarter_round(3, 7, 11, 15, res);
+            quarter_rounds(
+                [x00,x01,x02,x03],
+                [x04,x05,x06,x07],
+                [x08,x09,x10,x11],
+                [x12,x13,x14,x15]);
 
             // diagonal rounds
-            quarter_round(0, 5, 10, 15, res);
-            quarter_round(1, 6, 11, 12, res);
-            quarter_round(2, 7, 8, 13, res);
-            quarter_round(3, 4, 9, 14, res);
+            quarter_rounds(
+                [x00,x01,x02,x03],
+                [x05,x06,x07,x04],
+                [x10,x11,x08,x09],
+                [x15,x12,x13,x14]);
         }
     }
 
@@ -194,12 +230,14 @@ mod chacha {
 
         state = run_rounds(10, &state);
 
-        for (b, mask) in pt
-            .iter_mut()
-            .zip(state.0.iter().flat_map(|x| x.to_le_bytes()))
-        {
-            *b ^= mask;
+        for i in 0..state.0.len() {
+            let w = state.0[i];
+            let mask = w.to_le_bytes();
+            for j in 0..mask.len() {
+                pt[4*i+j] ^= mask[j];
+            }
         }
+
     }
 
     pub struct CipherState {
