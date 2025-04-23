@@ -3,12 +3,12 @@
 #[cfg(test)]
 extern crate quickcheck_macros;
 
-use blake2::Blake2bMac;
+// use blake2::Blake2bMac;
 use clap::{StructOpt, ValueEnum};
 use clap_complete::{generate, generate_to, Shell};
 use conv::ApproxFrom;
 use core::cmp::{max, min};
-use digest::{FixedOutput, Mac};
+// use digest::{FixedOutput, Mac};
 use generic_array::{ArrayLength, GenericArray};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -25,6 +25,8 @@ use typenum::{
     consts::{U32, U64},
     IsLessOrEqual, LeEq, NonZero,
 };
+
+
 
 enum ScrombleError {
     TooShort,
@@ -212,6 +214,7 @@ mod chacha {
         output
     }
 
+    #[inline(always)]
     fn chacha20_apply_block(
         key: &ChaChaKey,
         nonce: &ChaChaNonce,
@@ -307,6 +310,14 @@ mod chacha {
             Ok(())
         }
 
+        #[allow(unused)]
+        pub fn try_current_pos<U: std::convert::TryFrom<u128>>(
+            & self,
+        ) -> Result<U,ScrombleError> {
+            U::try_from((self.block_ix as u128)*64 + (self.offset as u128))
+                .map_err(|_| ScrombleError::Overflow)
+        }
+
         pub fn try_apply_keystream(
             &mut self,
             mut buffer: &mut [u8],
@@ -361,8 +372,46 @@ mod chacha {
                 }
             }
 
+            const N_CHUNKS: usize = 4;
+            while buffer.len() >= N_CHUNKS*64 {
+                let mut ixs = [0u64; N_CHUNKS];
+                for i in 0..N_CHUNKS {
+                    ixs[i] = block_ix.checked_add(i as u64)
+                        .ok_or(ScrombleError::Overflow)?;
+                }
+
+                let mut block = [[0u8; 64]; N_CHUNKS];
+                for i in 0..N_CHUNKS {
+                    block[i][..].copy_from_slice(&buffer[i*64..(i+1)*64]);
+                }
+
+                for i in 0..N_CHUNKS {
+                    chacha20_apply_block(
+                        key,
+                        nonce,
+                        ixs[i],
+                        &mut block[i],
+                    );
+                }
+
+                for i in 0..N_CHUNKS {
+                    buffer[i*64..(i+1)*64].copy_from_slice(&block[i][..]);
+                }
+
+                match block_ix.checked_add(N_CHUNKS as u64) {
+                    Some(ix) => {
+                        block_ix = ix;
+                    }
+                    None => {
+                        block_ix = u64::MAX;
+                        offset = 64;
+                    }
+                }
+
+                buffer = &mut buffer[N_CHUNKS*64..];
+            }
+
             while buffer.len() >= 64 {
-                assert_eq!(offset, 0);
 
                 let mut block = [0u8; 64];
                 block[..].copy_from_slice(&buffer[..64]);
@@ -376,9 +425,15 @@ mod chacha {
 
                 buffer[..64].copy_from_slice(&block[..]);
 
-                block_ix = block_ix
-                    .checked_add(1)
-                    .ok_or(ScrombleError::Overflow)?;
+                match block_ix.checked_add(1) {
+                    Some(ix) => {
+                        block_ix = ix;
+                    }
+                    None => {
+                        block_ix = u64::MAX;
+                        offset = 64;
+                    }
+                }
 
                 buffer = &mut buffer[64..];
             }
@@ -477,6 +532,59 @@ mod chacha {
                 }
             }
         }
+
+
+        mod overflow {
+            use super::*;
+
+            const OFFSET_256GB: u64 = 256u64 << 30;
+            const OFFSET_256PB: u64 = 256u64 << 50;
+            const OFFSET_1ZB: u128 = (64u128) << 64;
+
+            #[test]
+            fn xchacha_256gb() {
+                let mut cipher = CipherState::new(&Default::default(), &Default::default());
+                cipher
+                    .try_seek(OFFSET_256GB - 1)
+                    .expect("Couldn't seek to nearly 256GB");
+                let mut data = [0u8; 1];
+                cipher
+                    .try_apply_keystream(&mut data)
+                    .expect("Couldn't encrypt the last byte of 256GB");
+                assert_eq!(cipher.try_current_pos::<u64>().unwrap(), OFFSET_256GB);
+                let mut data = [0u8; 1];
+                cipher
+                    .try_apply_keystream(&mut data)
+                    .expect("Couldn't encrypt past the last byte of 256GB");
+            }
+
+            #[test]
+            fn xchacha_upper_limit() {
+                let mut cipher = CipherState::new(&Default::default(), &Default::default());
+                cipher
+                    .try_seek(OFFSET_1ZB - 1)
+                    .expect("Couldn't seek to nearly 1 zebibyte");
+                let mut data = [0u8; 1];
+                cipher
+                    .try_apply_keystream(&mut data)
+                    .expect("Couldn't encrypt the last byte of 1 zebibyte");
+                let mut data = [0u8; 1];
+                cipher
+                    .try_apply_keystream(&mut data)
+                    .expect_err("Could encrypt past 1 zebibyte");
+            }
+
+            #[test]
+            fn xchacha_has_a_big_counter() {
+                let mut cipher = CipherState::new(&Default::default(), &Default::default());
+                cipher.try_seek(OFFSET_256PB).expect("Could seek to 256PB");
+                let mut data = [0u8; 1];
+                cipher
+                    .try_apply_keystream(&mut data)
+                    .expect("Couldn't encrypt the next byte after 256PB");
+            }
+
+        }
     }
 
     #[cfg(test)]
@@ -548,16 +656,22 @@ where
     N: ArrayLength<u8> + IsLessOrEqual<U64>,
     LeEq<N, U64>: NonZero,
 {
-    let mut hasher = Blake2bMac::<N>::new_with_salt_and_personal(
-        k,
-        &[],
-        "sCrOmB2EnCrYpToR".as_bytes(),
-    )
-    .unwrap();
+
+    // let mut hasher = Blake2bMac::<N>::new_with_salt_and_personal(
+    //     k,
+    //     &[],
+    //     "sCrOmB2EnCrYpToR".as_bytes(),
+    // )
+
+    let mut hasher = blake2b_simd::Params::new()
+        .hash_length(N::to_usize())
+        .key(k)
+        .personal("sCrOmB2EnCrYpToR".as_bytes())
+        .to_state();
     for d in data {
         hasher.update(d);
     }
-    hasher.finalize_fixed()
+    <& GenericArray<u8,N>>::from(hasher.finalize().as_bytes()).clone()
 }
 
 // struct RootKey(Zeroizing<Secret<[u8; 64]>>);
@@ -581,7 +695,8 @@ struct Salt([u8; 64]);
 
 // TODO: figure out how to zeroize these and pin them in place.
 //       It isn't obvious that we can even pin all these.
-type HmacState = Box<Blake2bMac<U64>>;
+// type HmacState = Box<Blake2bMac<U64>>;
+type HmacState = Box<blake2b_simd::State>;
 // type CipherState = Box<chacha20::XChaCha20>;
 
 impl RootKey {
@@ -637,14 +752,11 @@ impl RootKey {
     ) -> (Box<chacha::CipherState>, HmacState) {
         let hmac_key =
             key2b::<U64>(&self.0.expose_secret().0, &["hmac".as_bytes()]);
-        let hmac = Box::new(
-            Blake2bMac::new_with_salt_and_personal(
-                &hmac_key,
-                &[],
-                "sCrOmB2AuThEnTiC".as_bytes(),
-            )
-            .unwrap(),
-        );
+        let hmac = Box::new(blake2b_simd::Params::new()
+            .hash_length(64)
+            .key(&hmac_key)
+            .personal("sCrOmB2AuThEnTiC".as_bytes())
+            .to_state());
         let cipher_key = key2b::<U32>(
             &self.0.expose_secret().0,
             &["encrypt".as_bytes()],
@@ -776,7 +888,8 @@ where
     write_data(&length_bytes)?;
 
     // write out the mac (we're done!)
-    writer.write_all(mac_state.finalize_fixed().as_slice())?;
+    // writer.write_all(mac_state.finalize_fixed().as_slice())?;
+    writer.write_all(mac_state.finalize().as_bytes())?;
 
     writer.flush()?;
 
@@ -788,7 +901,8 @@ const HMAC_SIZE: usize = 64;
 struct HmacTable<R: std::io::Read + std::io::Seek + ?Sized> {
     bytes_remaining: u64,
     block_size: u64,
-    hashes_reversed: Vec<digest::Output<Blake2bMac<U64>>>,
+    // hashes_reversed: Vec<digest::Output<blake2b_simd::State>>,
+    hashes_reversed: Vec<[u8;64]>,
     bytes_in_buffer: u64,
     inner_buffer: Vec<u8>,
     hmac: HmacState,
@@ -820,7 +934,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                     total_bytes_read += bytes_read as u64;
                     if bytes_in_buf == buf.len() {
                         hmac.update(&buf[..block_size]);
-                        prefix_hashes.push(hmac.clone().finalize_fixed());
+                        // prefix_hashes.push(hmac.clone().finalize_fixed());
+                        prefix_hashes.push(*hmac.clone().finalize().as_array());
 
                         last_8_bytes.copy_from_slice(
                             &buf[block_size - 8..block_size],
@@ -841,7 +956,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                             }
                             prefix_hashes.resize(
                                 prefix_hashes.len() / 2,
-                                Default::default(),
+                                // Default::default(),
+                                [0;64],
                             );
                             buf.resize(block_size + HMAC_SIZE, 0);
                         }
@@ -871,7 +987,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                 .copy_from_slice(&buf[buf_end - l8b_included..buf_end]);
         }
 
-        let final_mac = hmac.finalize_fixed();
+        // let final_mac = hmac.finalize_fixed();
+        let final_mac = *hmac.finalize().as_array();
 
         if !<bool>::from(
             final_mac
@@ -940,7 +1057,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                             .unwrap();
 
                         let segment_hash: [u8; HMAC_SIZE] =
-                            self.hmac.clone().finalize_fixed().into();
+                            *self.hmac.clone().finalize().as_array();
+                            // self.hmac.clone().finalize_fixed().into();
                         let expected_hash = self
                             .hashes_reversed
                             .pop()
@@ -976,7 +1094,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
         self.hmac
             .update(&buffer[..self.bytes_in_buffer as usize - HMAC_SIZE]);
 
-        let final_mac = self.hmac.clone().finalize_fixed();
+        // let final_mac = self.hmac.clone().finalize_fixed();
+        let final_mac = *self.hmac.clone().finalize().as_array();
         // can be an unwrap()
         let final_hash = self
             .hashes_reversed
