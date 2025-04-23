@@ -26,8 +26,6 @@ use typenum::{
     IsLessOrEqual, LeEq, NonZero,
 };
 
-
-
 enum ScrombleError {
     TooShort,
     BadHmac,
@@ -120,52 +118,51 @@ mod chacha {
     /// The ChaCha20 quarter round function
     #[inline(always)]
     fn quarter_rounds(
-        a: [&mut u32;4],
-        b: [&mut u32;4],
-        c: [&mut u32;4],
-        d: [&mut u32;4],
+        a: [&mut u32; 4],
+        b: [&mut u32; 4],
+        c: [&mut u32; 4],
+        d: [&mut u32; 4],
     ) {
         for i in 0..4 {
-            *a[i]  = a[i].wrapping_add(*b[i]);
+            *a[i] = a[i].wrapping_add(*b[i]);
             *d[i] ^= *a[i];
-            *d[i]  = d[i].rotate_left(16);
+            *d[i] = d[i].rotate_left(16);
 
-            *c[i]  = c[i].wrapping_add(*d[i]);
+            *c[i] = c[i].wrapping_add(*d[i]);
             *b[i] ^= *c[i];
-            *b[i]  = b[i].rotate_left(12);
+            *b[i] = b[i].rotate_left(12);
 
-            *a[i]  = a[i].wrapping_add(*b[i]);
+            *a[i] = a[i].wrapping_add(*b[i]);
             *d[i] ^= *a[i];
-            *d[i]  = d[i].rotate_left(8);
+            *d[i] = d[i].rotate_left(8);
 
-            *c[i]  = c[i].wrapping_add(*d[i]);
+            *c[i] = c[i].wrapping_add(*d[i]);
             *b[i] ^= *c[i];
-            *b[i]  = b[i].rotate_left(7);
+            *b[i] = b[i].rotate_left(7);
         }
     }
-
 
     #[inline(always)]
     fn run_rounds_inner(double_rounds: usize, res: &mut ChaChaState) {
         for _ in 0..double_rounds {
-            let [x00,x01,x02,x03,
-                 x04,x05,x06,x07,
-                 x08,x09,x10,x11,
-                 x12,x13,x14,x15] = &mut res.0;
+            let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
+                &mut res.0;
 
             // column rounds
             quarter_rounds(
-                [x00,x01,x02,x03],
-                [x04,x05,x06,x07],
-                [x08,x09,x10,x11],
-                [x12,x13,x14,x15]);
+                [x00, x01, x02, x03],
+                [x04, x05, x06, x07],
+                [x08, x09, x10, x11],
+                [x12, x13, x14, x15],
+            );
 
             // diagonal rounds
             quarter_rounds(
-                [x00,x01,x02,x03],
-                [x05,x06,x07,x04],
-                [x10,x11,x08,x09],
-                [x15,x12,x13,x14]);
+                [x00, x01, x02, x03],
+                [x05, x06, x07, x04],
+                [x10, x11, x08, x09],
+                [x15, x12, x13, x14],
+            );
         }
     }
 
@@ -237,10 +234,9 @@ mod chacha {
             let w = state.0[i];
             let mask = w.to_le_bytes();
             for j in 0..mask.len() {
-                pt[4*i+j] ^= mask[j];
+                pt[4 * i + j] ^= mask[j];
             }
         }
-
     }
 
     pub struct CipherState {
@@ -312,10 +308,12 @@ mod chacha {
 
         #[allow(unused)]
         pub fn try_current_pos<U: std::convert::TryFrom<u128>>(
-            & self,
-        ) -> Result<U,ScrombleError> {
-            U::try_from((self.block_ix as u128)*64 + (self.offset as u128))
-                .map_err(|_| ScrombleError::Overflow)
+            &self,
+        ) -> Result<U, ScrombleError> {
+            U::try_from(
+                (self.block_ix as u128) * 64 + (self.offset as u128),
+            )
+            .map_err(|_| ScrombleError::Overflow)
         }
 
         pub fn try_apply_keystream(
@@ -346,12 +344,7 @@ mod chacha {
                 block[off..off + num_bytes]
                     .copy_from_slice(&buffer[..num_bytes]);
 
-                chacha20_apply_block(
-                    key,
-                    nonce,
-                    block_ix,
-                    &mut block,
-                );
+                chacha20_apply_block(key, nonce, block_ix, &mut block);
 
                 buffer[..num_bytes]
                     .copy_from_slice(&block[off..off + num_bytes]);
@@ -373,16 +366,18 @@ mod chacha {
             }
 
             const N_CHUNKS: usize = 4;
-            while buffer.len() >= N_CHUNKS*64 {
+            while buffer.len() >= N_CHUNKS * 64 {
                 let mut ixs = [0u64; N_CHUNKS];
                 for i in 0..N_CHUNKS {
-                    ixs[i] = block_ix.checked_add(i as u64)
+                    ixs[i] = block_ix
+                        .checked_add(i as u64)
                         .ok_or(ScrombleError::Overflow)?;
                 }
 
                 let mut block = [[0u8; 64]; N_CHUNKS];
                 for i in 0..N_CHUNKS {
-                    block[i][..].copy_from_slice(&buffer[i*64..(i+1)*64]);
+                    block[i][..]
+                        .copy_from_slice(&buffer[i * 64..(i + 1) * 64]);
                 }
 
                 for i in 0..N_CHUNKS {
@@ -395,7 +390,8 @@ mod chacha {
                 }
 
                 for i in 0..N_CHUNKS {
-                    buffer[i*64..(i+1)*64].copy_from_slice(&block[i][..]);
+                    buffer[i * 64..(i + 1) * 64]
+                        .copy_from_slice(&block[i][..]);
                 }
 
                 match block_ix.checked_add(N_CHUNKS as u64) {
@@ -408,20 +404,14 @@ mod chacha {
                     }
                 }
 
-                buffer = &mut buffer[N_CHUNKS*64..];
+                buffer = &mut buffer[N_CHUNKS * 64..];
             }
 
             while buffer.len() >= 64 {
-
                 let mut block = [0u8; 64];
                 block[..].copy_from_slice(&buffer[..64]);
 
-                chacha20_apply_block(
-                    key,
-                    nonce,
-                    block_ix,
-                    &mut block,
-                );
+                chacha20_apply_block(key, nonce, block_ix, &mut block);
 
                 buffer[..64].copy_from_slice(&block[..]);
 
@@ -445,12 +435,7 @@ mod chacha {
                 let mut block = [0u8; 64];
                 block[..buffer.len()].copy_from_slice(&buffer[..]);
 
-                chacha20_apply_block(
-                    key,
-                    nonce,
-                    block_ix,
-                    &mut block,
-                );
+                chacha20_apply_block(key, nonce, block_ix, &mut block);
 
                 let buflen = buffer.len();
                 buffer[..].copy_from_slice(&block[..buflen]);
@@ -533,7 +518,6 @@ mod chacha {
             }
         }
 
-
         mod overflow {
             use super::*;
 
@@ -543,7 +527,10 @@ mod chacha {
 
             #[test]
             fn xchacha_256gb() {
-                let mut cipher = CipherState::new(&Default::default(), &Default::default());
+                let mut cipher = CipherState::new(
+                    &Default::default(),
+                    &Default::default(),
+                );
                 cipher
                     .try_seek(OFFSET_256GB - 1)
                     .expect("Couldn't seek to nearly 256GB");
@@ -551,23 +538,29 @@ mod chacha {
                 cipher
                     .try_apply_keystream(&mut data)
                     .expect("Couldn't encrypt the last byte of 256GB");
-                assert_eq!(cipher.try_current_pos::<u64>().unwrap(), OFFSET_256GB);
+                assert_eq!(
+                    cipher.try_current_pos::<u64>().unwrap(),
+                    OFFSET_256GB
+                );
                 let mut data = [0u8; 1];
-                cipher
-                    .try_apply_keystream(&mut data)
-                    .expect("Couldn't encrypt past the last byte of 256GB");
+                cipher.try_apply_keystream(&mut data).expect(
+                    "Couldn't encrypt past the last byte of 256GB",
+                );
             }
 
             #[test]
             fn xchacha_upper_limit() {
-                let mut cipher = CipherState::new(&Default::default(), &Default::default());
+                let mut cipher = CipherState::new(
+                    &Default::default(),
+                    &Default::default(),
+                );
                 cipher
                     .try_seek(OFFSET_1ZB - 1)
                     .expect("Couldn't seek to nearly 1 zebibyte");
                 let mut data = [0u8; 1];
-                cipher
-                    .try_apply_keystream(&mut data)
-                    .expect("Couldn't encrypt the last byte of 1 zebibyte");
+                cipher.try_apply_keystream(&mut data).expect(
+                    "Couldn't encrypt the last byte of 1 zebibyte",
+                );
                 let mut data = [0u8; 1];
                 cipher
                     .try_apply_keystream(&mut data)
@@ -576,14 +569,18 @@ mod chacha {
 
             #[test]
             fn xchacha_has_a_big_counter() {
-                let mut cipher = CipherState::new(&Default::default(), &Default::default());
-                cipher.try_seek(OFFSET_256PB).expect("Could seek to 256PB");
+                let mut cipher = CipherState::new(
+                    &Default::default(),
+                    &Default::default(),
+                );
+                cipher
+                    .try_seek(OFFSET_256PB)
+                    .expect("Could seek to 256PB");
                 let mut data = [0u8; 1];
                 cipher
                     .try_apply_keystream(&mut data)
                     .expect("Couldn't encrypt the next byte after 256PB");
             }
-
         }
     }
 
@@ -656,7 +653,6 @@ where
     N: ArrayLength<u8> + IsLessOrEqual<U64>,
     LeEq<N, U64>: NonZero,
 {
-
     // let mut hasher = Blake2bMac::<N>::new_with_salt_and_personal(
     //     k,
     //     &[],
@@ -671,7 +667,7 @@ where
     for d in data {
         hasher.update(d);
     }
-    <& GenericArray<u8,N>>::from(hasher.finalize().as_bytes()).clone()
+    <&GenericArray<u8, N>>::from(hasher.finalize().as_bytes()).clone()
 }
 
 // struct RootKey(Zeroizing<Secret<[u8; 64]>>);
@@ -752,11 +748,13 @@ impl RootKey {
     ) -> (Box<chacha::CipherState>, HmacState) {
         let hmac_key =
             key2b::<U64>(&self.0.expose_secret().0, &["hmac".as_bytes()]);
-        let hmac = Box::new(blake2b_simd::Params::new()
-            .hash_length(64)
-            .key(&hmac_key)
-            .personal("sCrOmB2AuThEnTiC".as_bytes())
-            .to_state());
+        let hmac = Box::new(
+            blake2b_simd::Params::new()
+                .hash_length(64)
+                .key(&hmac_key)
+                .personal("sCrOmB2AuThEnTiC".as_bytes())
+                .to_state(),
+        );
         let cipher_key = key2b::<U32>(
             &self.0.expose_secret().0,
             &["encrypt".as_bytes()],
@@ -902,7 +900,7 @@ struct HmacTable<R: std::io::Read + std::io::Seek + ?Sized> {
     bytes_remaining: u64,
     block_size: u64,
     // hashes_reversed: Vec<digest::Output<blake2b_simd::State>>,
-    hashes_reversed: Vec<[u8;64]>,
+    hashes_reversed: Vec<[u8; 64]>,
     bytes_in_buffer: u64,
     inner_buffer: Vec<u8>,
     hmac: HmacState,
@@ -935,7 +933,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                     if bytes_in_buf == buf.len() {
                         hmac.update(&buf[..block_size]);
                         // prefix_hashes.push(hmac.clone().finalize_fixed());
-                        prefix_hashes.push(*hmac.clone().finalize().as_array());
+                        prefix_hashes
+                            .push(*hmac.clone().finalize().as_array());
 
                         last_8_bytes.copy_from_slice(
                             &buf[block_size - 8..block_size],
@@ -957,7 +956,7 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                             prefix_hashes.resize(
                                 prefix_hashes.len() / 2,
                                 // Default::default(),
-                                [0;64],
+                                [0; 64],
                             );
                             buf.resize(block_size + HMAC_SIZE, 0);
                         }
@@ -1058,7 +1057,7 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
 
                         let segment_hash: [u8; HMAC_SIZE] =
                             *self.hmac.clone().finalize().as_array();
-                            // self.hmac.clone().finalize_fixed().into();
+                        // self.hmac.clone().finalize_fixed().into();
                         let expected_hash = self
                             .hashes_reversed
                             .pop()
