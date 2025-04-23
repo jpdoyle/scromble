@@ -143,8 +143,8 @@ mod chacha {
     }
 
     #[inline(always)]
-    fn run_rounds_inner(double_rounds: usize, res: &mut ChaChaState) {
-        for _ in 0..double_rounds {
+    fn run_rounds_inner<const DOUBLE_ROUNDS: usize>(res: &mut ChaChaState) {
+        for _ in 0..DOUBLE_ROUNDS {
             let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
                 &mut res.0;
 
@@ -167,13 +167,12 @@ mod chacha {
     }
 
     #[inline(always)]
-    fn run_rounds(
-        double_rounds: usize,
+    fn run_rounds<const DOUBLE_ROUNDS: usize>(
         state: &ChaChaState,
     ) -> ChaChaState {
         let mut res = *state;
 
-        run_rounds_inner(double_rounds, &mut res);
+        run_rounds_inner::<DOUBLE_ROUNDS>(&mut res);
 
         for (s1, s0) in res.0.iter_mut().zip(state.0.iter()) {
             *s1 = s1.wrapping_add(*s0);
@@ -201,7 +200,7 @@ mod chacha {
         state.0[4..12].copy_from_slice(&key.0[..]);
         state.0[12..16].copy_from_slice(&nonce.0[..]);
 
-        run_rounds_inner(10, &mut state);
+        run_rounds_inner::<10>(&mut state);
 
         let mut output = ChaChaKey::default();
 
@@ -212,29 +211,36 @@ mod chacha {
     }
 
     #[inline(always)]
-    fn chacha20_apply_block(
+    fn chacha20_apply_blocks<const N_BLOCKS: usize>(
         key: &ChaChaKey,
         nonce: &ChaChaNonce,
-        block_ix: u64,
-        pt: &mut [u8; 64],
+        block_ixs: [u64;N_BLOCKS],
+        pt: &mut [[u8;64]; N_BLOCKS],
     ) {
-        let mut state = ChaChaState::default();
-        state.0[..4].copy_from_slice(&CONSTANTS);
+        let mut states = [ChaChaState::default();N_BLOCKS];
 
-        state.0[4..12].copy_from_slice(&key.0[..]);
+        for i in 0..N_BLOCKS {
+            states[i].0[..4].copy_from_slice(&CONSTANTS);
 
-        state.0[12] = (block_ix & 0xffff_ffff) as u32;
-        state.0[13] = ((block_ix >> 32) & 0xffff_ffff) as u32;
-        state.0[14] = nonce.0[0];
-        state.0[15] = nonce.0[1];
+            states[i].0[4..12].copy_from_slice(&key.0[..]);
 
-        state = run_rounds(10, &state);
+            states[i].0[12] = (block_ixs[i] & 0xffff_ffff) as u32;
+            states[i].0[13] = ((block_ixs[i] >> 32) & 0xffff_ffff) as u32;
+            states[i].0[14] = nonce.0[0];
+            states[i].0[15] = nonce.0[1];
+        }
 
-        for i in 0..state.0.len() {
-            let w = state.0[i];
-            let mask = w.to_le_bytes();
-            for j in 0..mask.len() {
-                pt[4 * i + j] ^= mask[j];
+        for i in 0..N_BLOCKS {
+            states[i] = run_rounds::<10>(&states[i]);
+        }
+
+        for i in 0..N_BLOCKS {
+            for j in 0..states[i].0.len() {
+                let w = states[i].0[j];
+                let mask = w.to_le_bytes();
+                for k in 0..mask.len() {
+                    pt[i][4 * j + k] ^= mask[k];
+                }
             }
         }
     }
@@ -339,15 +345,15 @@ mod chacha {
 
             if offset > 0 {
                 let num_bytes = min(buffer.len(), 64 - (offset as usize));
-                let mut block = [0u8; 64];
+                let mut block = [[0u8; 64];1];
                 let off = offset as usize;
-                block[off..off + num_bytes]
+                block[0][off..off + num_bytes]
                     .copy_from_slice(&buffer[..num_bytes]);
 
-                chacha20_apply_block(key, nonce, block_ix, &mut block);
+                chacha20_apply_blocks::<1>(key, nonce, [block_ix], &mut block);
 
                 buffer[..num_bytes]
-                    .copy_from_slice(&block[off..off + num_bytes]);
+                    .copy_from_slice(&block[0][off..off + num_bytes]);
 
                 offset += num_bytes as u8;
                 buffer = &mut buffer[num_bytes..];
@@ -374,24 +380,20 @@ mod chacha {
                         .ok_or(ScrombleError::Overflow)?;
                 }
 
-                let mut block = [[0u8; 64]; N_CHUNKS];
+                let mut block = [[0u8; 64];N_CHUNKS];
                 for i in 0..N_CHUNKS {
-                    block[i][..]
-                        .copy_from_slice(&buffer[i * 64..(i + 1) * 64]);
+                    block[i][..].copy_from_slice(&buffer[i*64..64*(i+1)]);
                 }
 
-                for i in 0..N_CHUNKS {
-                    chacha20_apply_block(
-                        key,
-                        nonce,
-                        ixs[i],
-                        &mut block[i],
-                    );
-                }
+                chacha20_apply_blocks::<N_CHUNKS>(
+                    key,
+                    nonce,
+                    ixs,
+                    &mut block,
+                );
 
                 for i in 0..N_CHUNKS {
-                    buffer[i * 64..(i + 1) * 64]
-                        .copy_from_slice(&block[i][..]);
+                    buffer[i*64..64*(i+1)].copy_from_slice(&block[i][..]);
                 }
 
                 match block_ix.checked_add(N_CHUNKS as u64) {
@@ -408,12 +410,12 @@ mod chacha {
             }
 
             while buffer.len() >= 64 {
-                let mut block = [0u8; 64];
-                block[..].copy_from_slice(&buffer[..64]);
+                let mut block = [[0u8; 64];1];
+                block[0][..].copy_from_slice(&buffer[..64]);
 
-                chacha20_apply_block(key, nonce, block_ix, &mut block);
+                chacha20_apply_blocks::<1>(key, nonce, [block_ix], &mut block);
 
-                buffer[..64].copy_from_slice(&block[..]);
+                buffer[..64].copy_from_slice(&block[0][..]);
 
                 match block_ix.checked_add(1) {
                     Some(ix) => {
@@ -432,13 +434,13 @@ mod chacha {
                 assert!(buffer.len() <= 63);
                 assert_eq!(offset, 0);
 
-                let mut block = [0u8; 64];
-                block[..buffer.len()].copy_from_slice(&buffer[..]);
+                let mut block = [[0u8; 64]; 1];
+                block[0][..buffer.len()].copy_from_slice(&buffer[..]);
 
-                chacha20_apply_block(key, nonce, block_ix, &mut block);
+                chacha20_apply_blocks::<1>(key, nonce, [block_ix], &mut block);
 
                 let buflen = buffer.len();
-                buffer[..].copy_from_slice(&block[..buflen]);
+                buffer[..].copy_from_slice(&block[0][..buflen]);
 
                 offset = buffer.len() as u8;
             }
@@ -1298,7 +1300,7 @@ mod test {
         .unwrap();
 
         let corruption_pos = (corruption_pos as usize) % enc_file.len();
-        for (i, x) in core::iter::once(corruption_mask.0)
+        for (i, x) in core::iter::once(corruption_mask.0|1)
             .chain((corruption_mask.1).into_iter())
             .enumerate()
         {
