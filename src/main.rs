@@ -3,12 +3,12 @@
 #[cfg(test)]
 extern crate quickcheck_macros;
 
-// use blake2::Blake2bMac;
+use blake2::Blake2bMac;
 use clap::{StructOpt, ValueEnum};
 use clap_complete::{generate, generate_to, Shell};
 use conv::ApproxFrom;
 use core::cmp::{max, min};
-// use digest::{FixedOutput, Mac};
+use digest::{FixedOutput, Mac};
 use generic_array::{ArrayLength, GenericArray};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -654,21 +654,22 @@ where
     N: ArrayLength<u8> + IsLessOrEqual<U64>,
     LeEq<N, U64>: NonZero,
 {
-    // let mut hasher = Blake2bMac::<N>::new_with_salt_and_personal(
-    //     k,
-    //     &[],
-    //     "sCrOmB2EnCrYpToR".as_bytes(),
-    // )
+    let mut hasher = Blake2bMac::<N>::new_with_salt_and_personal(
+        k,
+        &[],
+        "sCrOmB2EnCrYpToR".as_bytes(),
+    ).unwrap();
 
-    let mut hasher = blake2b_simd::Params::new()
-        .hash_length(N::to_usize())
-        .key(k)
-        .personal("sCrOmB2EnCrYpToR".as_bytes())
-        .to_state();
+    // let mut hasher = blake2b_simd::Params::new()
+    //     .hash_length(N::to_usize())
+    //     .key(k)
+    //     .personal("sCrOmB2EnCrYpToR".as_bytes())
+    //     .to_state();
     for d in data {
         hasher.update(d);
     }
-    <&GenericArray<u8, N>>::from(hasher.finalize().as_bytes()).clone()
+    // <&GenericArray<u8, N>>::from(hasher.finalize().as_bytes()).clone()
+    hasher.finalize_fixed()
 }
 
 // struct RootKey(Zeroizing<Secret<[u8; 64]>>);
@@ -692,8 +693,8 @@ struct Salt([u8; 64]);
 
 // TODO: figure out how to zeroize these and pin them in place.
 //       It isn't obvious that we can even pin all these.
-// type HmacState = Box<Blake2bMac<U64>>;
-type HmacState = Box<blake2b_simd::State>;
+type HmacState = Box<Blake2bMac<U64>>;
+// type HmacState = Box<blake2b_simd::State>;
 // type CipherState = Box<chacha20::XChaCha20>;
 
 impl RootKey {
@@ -749,13 +750,23 @@ impl RootKey {
     ) -> (Box<chacha::CipherState>, HmacState) {
         let hmac_key =
             key2b::<U64>(&self.0.expose_secret().0, &["hmac".as_bytes()]);
+
+        // let hmac = Box::new(
+        //     blake2b_simd::Params::new()
+        //         .hash_length(64)
+        //         .key(&hmac_key)
+        //         .personal("sCrOmB2AuThEnTiC".as_bytes())
+        //         .to_state(),
+        // );
+
         let hmac = Box::new(
-            blake2b_simd::Params::new()
-                .hash_length(64)
-                .key(&hmac_key)
-                .personal("sCrOmB2AuThEnTiC".as_bytes())
-                .to_state(),
+            Blake2bMac::new_with_salt_and_personal(
+                &hmac_key,
+                &[],
+                "sCrOmB2AuThEnTiC".as_bytes(),
+            ).unwrap()
         );
+
         let cipher_key = key2b::<U32>(
             &self.0.expose_secret().0,
             &["encrypt".as_bytes()],
@@ -887,8 +898,8 @@ where
     write_data(&length_bytes)?;
 
     // write out the mac (we're done!)
-    // writer.write_all(mac_state.finalize_fixed().as_slice())?;
-    writer.write_all(mac_state.finalize().as_bytes())?;
+    writer.write_all(mac_state.finalize_fixed().as_slice())?;
+    // writer.write_all(mac_state.finalize().as_bytes())?;
 
     writer.flush()?;
 
@@ -900,8 +911,8 @@ const HMAC_SIZE: usize = 64;
 struct HmacTable<R: std::io::Read + std::io::Seek + ?Sized> {
     bytes_remaining: u64,
     block_size: u64,
-    // hashes_reversed: Vec<digest::Output<blake2b_simd::State>>,
-    hashes_reversed: Vec<[u8; 64]>,
+    hashes_reversed: Vec<digest::Output<Blake2bMac<U64>>>,
+    // hashes_reversed: Vec<[u8; 64]>,
     bytes_in_buffer: u64,
     inner_buffer: Vec<u8>,
     hmac: HmacState,
@@ -933,9 +944,9 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                     total_bytes_read += bytes_read as u64;
                     if bytes_in_buf == buf.len() {
                         hmac.update(&buf[..block_size]);
-                        // prefix_hashes.push(hmac.clone().finalize_fixed());
-                        prefix_hashes
-                            .push(*hmac.clone().finalize().as_array());
+                        prefix_hashes.push(hmac.clone().finalize_fixed());
+                        // prefix_hashes
+                        //     .push(*hmac.clone().finalize().as_array());
 
                         last_8_bytes.copy_from_slice(
                             &buf[block_size - 8..block_size],
@@ -956,8 +967,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                             }
                             prefix_hashes.resize(
                                 prefix_hashes.len() / 2,
-                                // Default::default(),
-                                [0; 64],
+                                Default::default(),
+                                // [0; 64],
                             );
                             buf.resize(block_size + HMAC_SIZE, 0);
                         }
@@ -987,8 +998,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                 .copy_from_slice(&buf[buf_end - l8b_included..buf_end]);
         }
 
-        // let final_mac = hmac.finalize_fixed();
-        let final_mac = *hmac.finalize().as_array();
+        let final_mac = hmac.finalize_fixed();
+        // let final_mac = *hmac.finalize().as_array();
 
         if !<bool>::from(
             final_mac
@@ -1057,8 +1068,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                             .unwrap();
 
                         let segment_hash: [u8; HMAC_SIZE] =
-                            *self.hmac.clone().finalize().as_array();
-                        // self.hmac.clone().finalize_fixed().into();
+                            // *self.hmac.clone().finalize().as_array();
+                            self.hmac.clone().finalize_fixed().into();
                         let expected_hash = self
                             .hashes_reversed
                             .pop()
@@ -1094,8 +1105,8 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
         self.hmac
             .update(&buffer[..self.bytes_in_buffer as usize - HMAC_SIZE]);
 
-        // let final_mac = self.hmac.clone().finalize_fixed();
-        let final_mac = *self.hmac.clone().finalize().as_array();
+        let final_mac = self.hmac.clone().finalize_fixed();
+        // let final_mac = *self.hmac.clone().finalize().as_array();
         // can be an unwrap()
         let final_hash = self
             .hashes_reversed
