@@ -1,4 +1,5 @@
 #![deny(warnings)]
+#![allow(unused)]
 
 #[cfg(test)]
 extern crate quickcheck_macros;
@@ -116,7 +117,7 @@ mod chacha {
     }
 
     /// The ChaCha20 quarter round function
-    #[inline(always)]
+    // #[inline(always)]
     fn quarter_rounds(
         a: [&mut u32; 4],
         b: [&mut u32; 4],
@@ -140,6 +141,241 @@ mod chacha {
             *b[i] ^= *c[i];
             *b[i] = b[i].rotate_left(7);
         }
+    }
+
+    /// The ChaCha20 quarter round function
+    #[inline(always)]
+    fn quarter_rounds2<const WIDTH: usize>(
+        mut a: [u32; WIDTH],
+        mut b: [u32; WIDTH],
+        mut c: [u32; WIDTH],
+        mut d: [u32; WIDTH],
+    ) -> [[u32;WIDTH];4]{
+        for i in 0..WIDTH {
+            a[i] = a[i].wrapping_add(b[i]);
+            d[i] ^= a[i];
+            d[i] = d[i].rotate_left(16);
+
+            c[i] = c[i].wrapping_add(d[i]);
+            b[i] ^= c[i];
+            b[i] = b[i].rotate_left(12);
+
+            a[i] = a[i].wrapping_add(b[i]);
+            d[i] ^= a[i];
+            d[i] = d[i].rotate_left(8);
+
+            c[i] = c[i].wrapping_add(d[i]);
+            b[i] ^= c[i];
+            b[i] = b[i].rotate_left(7);
+        }
+        [a,b,c,d]
+    }
+
+    /// The ChaCha20 quarter round function
+    #[inline(always)]
+    fn quarter_rounds3<const WIDTH: usize, const HEIGHT: usize>(
+        mut a: [[u32; WIDTH];HEIGHT],
+        mut b: [[u32; WIDTH];HEIGHT],
+        mut c: [[u32; WIDTH];HEIGHT],
+        mut d: [[u32; WIDTH];HEIGHT],
+    ) -> [[[u32;WIDTH];HEIGHT];4]{
+        for i in 0..WIDTH {
+            for j in 0..HEIGHT {
+                a[j][i] = a[j][i].wrapping_add(b[j][i]);
+                d[j][i] ^= a[j][i];
+                d[j][i] = d[j][i].rotate_left(16);
+
+                c[j][i] = c[j][i].wrapping_add(d[j][i]);
+                b[j][i] ^= c[j][i];
+                b[j][i] = b[j][i].rotate_left(12);
+
+                a[j][i] = a[j][i].wrapping_add(b[j][i]);
+                d[j][i] ^= a[j][i];
+                d[j][i] = d[j][i].rotate_left(8);
+
+                c[j][i] = c[j][i].wrapping_add(d[j][i]);
+                b[j][i] ^= c[j][i];
+                b[j][i] = b[j][i].rotate_left(7);
+            }
+        }
+        [a,b,c,d]
+    }
+
+
+    #[inline(always)]
+    fn run_rounds_inner_batch_transpose<const DOUBLE_ROUNDS: usize,const BATCH_SIZE: usize>(mut res: [ChaChaState;BATCH_SIZE]) -> [ChaChaState;BATCH_SIZE] {
+        let mut s = [[0u32;BATCH_SIZE];16];
+        for i in 0..BATCH_SIZE {
+            for j in 0..16 {
+                s[j][i] = res[i].0[j];
+            }
+        }
+
+        let [mut x00, mut x01, mut x02, mut x03, mut x04, mut x05, mut x06, mut x07, mut x08, mut x09, mut x10, mut x11, mut x12, mut x13, mut x14, mut x15] =
+            s;
+        for _ in 0..DOUBLE_ROUNDS {
+
+            // column rounds
+            [
+                [x00, x01, x02, x03],
+                [x04, x05, x06, x07],
+                [x08, x09, x10, x11],
+                [x12, x13, x14, x15],
+            ] = quarter_rounds3::<BATCH_SIZE,4>(
+                [x00, x01, x02, x03],
+                [x04, x05, x06, x07],
+                [x08, x09, x10, x11],
+                [x12, x13, x14, x15],
+            );
+            // diagonal rounds
+            [
+                [x00, x01, x02, x03],
+                [x05, x06, x07, x04],
+                [x10, x11, x08, x09],
+                [x15, x12, x13, x14],
+            ] = quarter_rounds3::<BATCH_SIZE,4>(
+                [x00, x01, x02, x03],
+                [x05, x06, x07, x04],
+                [x10, x11, x08, x09],
+                [x15, x12, x13, x14],
+            );
+
+            // // column rounds
+            // [x00, x04, x08, x12] = quarter_rounds2::<BATCH_SIZE>(x00, x04, x08, x12);
+            // [x01, x05, x09, x13] = quarter_rounds2::<BATCH_SIZE>(x01, x05, x09, x13);
+            // [x02, x06, x10, x14] = quarter_rounds2::<BATCH_SIZE>(x02, x06, x10, x14);
+            // [x03, x07, x11, x15] = quarter_rounds2::<BATCH_SIZE>(x03, x07, x11, x15);
+            // // diagonal rounds
+            // [x00, x05, x10, x15] = quarter_rounds2::<BATCH_SIZE>(x00, x05, x10, x15);
+            // [x01, x06, x11, x12] = quarter_rounds2::<BATCH_SIZE>(x01, x06, x11, x12);
+            // [x02, x07, x08, x13] = quarter_rounds2::<BATCH_SIZE>(x02, x07, x08, x13);
+            // [x03, x04, x09, x14] = quarter_rounds2::<BATCH_SIZE>(x03, x04, x09, x14);
+
+        }
+        s = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15];
+
+        for i in 0..BATCH_SIZE {
+            for j in 0..16 {
+                res[i].0[j] = s[j][i];
+            }
+        }
+        res
+    }
+
+    #[inline(always)]
+    fn run_rounds_inner_batch<const DOUBLE_ROUNDS: usize,const BATCH_SIZE: usize>(mut res: [ChaChaState;BATCH_SIZE]) -> [ChaChaState;BATCH_SIZE] {
+        for _ in 0..DOUBLE_ROUNDS {
+
+            for i in 0..(BATCH_SIZE/2) {
+                let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
+                    res[2*i].0;
+                let [y00, y01, y02, y03, y04, y05, y06, y07, y08, y09, y10, y11, y12, y13, y14, y15] =
+                    res[2*i+1].0;
+                // column rounds
+                let [
+                    [x00, x01, x02, x03, y00, y01, y02, y03],
+                    [x04, x05, x06, x07, y04, y05, y06, y07],
+                    [x08, x09, x10, x11, y08, y09, y10, y11],
+                    [x12, x13, x14, x15, y12, y13, y14, y15],
+                ] = quarter_rounds2::<8>(
+                    [x00, x01, x02, x03, y00, y01, y02, y03],
+                    [x04, x05, x06, x07, y04, y05, y06, y07],
+                    [x08, x09, x10, x11, y08, y09, y10, y11],
+                    [x12, x13, x14, x15, y12, y13, y14, y15],
+                );
+
+                // diagonal rounds
+                let [
+                    [x00, x01, x02, x03, y00, y01, y02, y03],
+                    [x05, x06, x07, x04, y05, y06, y07, y04],
+                    [x10, x11, x08, x09, y10, y11, y08, y09],
+                    [x15, x12, x13, x14, y15, y12, y13, y14],
+                ] = quarter_rounds2::<8>(
+                    [x00, x01, x02, x03, y00, y01, y02, y03],
+                    [x05, x06, x07, x04, y05, y06, y07, y04],
+                    [x10, x11, x08, x09, y10, y11, y08, y09],
+                    [x15, x12, x13, x14, y15, y12, y13, y14],
+                );
+
+                res[2*i].0 = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15];
+                res[2*i+1].0 = [y00, y01, y02, y03, y04, y05, y06, y07, y08, y09, y10, y11, y12, y13, y14, y15];
+
+            }
+
+            for i in (2*(BATCH_SIZE/2))..BATCH_SIZE {
+                let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
+                    res[i].0;
+                // column rounds
+                let [
+                    [x00, x01, x02, x03],
+                    [x04, x05, x06, x07],
+                    [x08, x09, x10, x11],
+                    [x12, x13, x14, x15],
+                ] = quarter_rounds2::<4>(
+                    [x00, x01, x02, x03],
+                    [x04, x05, x06, x07],
+                    [x08, x09, x10, x11],
+                    [x12, x13, x14, x15],
+                );
+                // diagonal rounds
+                let [
+                    [x00, x01, x02, x03],
+                    [x05, x06, x07, x04],
+                    [x10, x11, x08, x09],
+                    [x15, x12, x13, x14],
+                ] = quarter_rounds2::<4>(
+                    [x00, x01, x02, x03],
+                    [x05, x06, x07, x04],
+                    [x10, x11, x08, x09],
+                    [x15, x12, x13, x14],
+                );
+
+                res[i].0 = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15]
+
+            }
+
+            // for i in 0..(BATCH_SIZE/2) {
+            //     let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
+            //         res[2*i].0;
+            //     let [y00, y01, y02, y03, y04, y05, y06, y07, y08, y09, y10, y11, y12, y13, y14, y15] =
+            //         res[2*i+1].0;
+
+            //     // diagonal rounds
+            //     let [
+            //         [x00, x01, x02, x03, y00, y01, y02, y03],
+            //         [x05, x06, x07, x04, y05, y06, y07, y04],
+            //         [x10, x11, x08, x09, y10, y11, y08, y09],
+            //         [x15, x12, x13, x14, y15, y12, y13, y14],
+            //     ] = quarter_rounds2::<8>(
+            //         [x00, x01, x02, x03, y00, y01, y02, y03],
+            //         [x05, x06, x07, x04, y05, y06, y07, y04],
+            //         [x10, x11, x08, x09, y10, y11, y08, y09],
+            //         [x15, x12, x13, x14, y15, y12, y13, y14],
+            //     );
+
+            //     res[2*i].0 = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15];
+            //     res[2*i+1].0 = [y00, y01, y02, y03, y04, y05, y06, y07, y08, y09, y10, y11, y12, y13, y14, y15];
+            // }
+
+            // for i in (2*(BATCH_SIZE/2))..BATCH_SIZE {
+            //     let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
+            //         res[i].0;
+            //     // diagonal rounds
+            //     let [
+            //         [x00, x01, x02, x03],
+            //         [x05, x06, x07, x04],
+            //         [x10, x11, x08, x09],
+            //         [x15, x12, x13, x14],
+            //     ] = quarter_rounds2::<4>(
+            //         [x00, x01, x02, x03],
+            //         [x05, x06, x07, x04],
+            //         [x10, x11, x08, x09],
+            //         [x15, x12, x13, x14],
+            //     );
+            //     res[i].0 = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15]
+            // }
+        }
+        res
     }
 
     #[inline(always)]
@@ -168,6 +404,7 @@ mod chacha {
     }
 
     #[inline(always)]
+    #[allow(unused)]
     fn run_rounds<const DOUBLE_ROUNDS: usize>(
         state: &ChaChaState,
     ) -> ChaChaState {
@@ -175,6 +412,21 @@ mod chacha {
 
         for (s1, s0) in res.0.iter_mut().zip(state.0.iter()) {
             *s1 = s1.wrapping_add(*s0);
+        }
+        res
+    }
+
+    #[inline(always)]
+    fn run_rounds_batch<const DOUBLE_ROUNDS: usize,const BATCH_SIZE: usize>(
+        state: [ChaChaState;BATCH_SIZE],
+    ) -> [ChaChaState;BATCH_SIZE] {
+        // let mut res = run_rounds_inner_batch::<DOUBLE_ROUNDS,BATCH_SIZE>(*state);
+        let mut res = run_rounds_inner_batch_transpose::<DOUBLE_ROUNDS,BATCH_SIZE>(state.clone());
+
+        for (i,s) in IntoIterator::into_iter(state).enumerate() {
+            for (s1, s0) in res[i].0.iter_mut().zip(IntoIterator::into_iter(s.0)) {
+                *s1 = s1.wrapping_add(s0);
+            }
         }
         res
     }
@@ -229,9 +481,10 @@ mod chacha {
             states[i].0[15] = nonce.0[1];
         }
 
-        for i in 0..N_BLOCKS {
-            states[i] = run_rounds::<10>(&states[i]);
-        }
+        states = run_rounds_batch::<10,N_BLOCKS>(states);
+        // for i in 0..N_BLOCKS {
+        //     states[i] = run_rounds::<10>(&states[i]);
+        // }
 
         for i in 0..N_BLOCKS {
             for j in 0..states[i].0.len() {
