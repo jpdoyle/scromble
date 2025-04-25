@@ -14,7 +14,7 @@ Intended security properties
             hash functions (`argon2i` and `blake2b`)
         (b) Authenticating with an HMAC over the whole file.
     - Any violation of this property _should_ yield a collision in either
-      `argon2i` or `blake2b`.
+      `argon2i`, `argon2id`, or `blake2b`.
     - A related secondary property that `scromble` aims for is that it only
       outputs any data if that data can be guaranteed to come from
       the HMAC-authenticated file, even if someone changes the underlying
