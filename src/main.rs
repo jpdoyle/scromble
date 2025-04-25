@@ -19,6 +19,8 @@ use std::io::ErrorKind;
 use std::io::Seek;
 use std::io::Write;
 use std::path::PathBuf;
+use std::thread;
+use std::sync::mpsc;
 use subtle::ConstantTimeEq;
 use typenum::{
     consts::{U32, U64},
@@ -827,8 +829,6 @@ where
     let (mut cipher, mut mac_state) =
         RootKey::new(pw, &salt).create_states(nonce.0.clone());
 
-    let mut buffer = [0u8; 64 << 10];
-
     let mut write_data =
         |buf: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
             writer.write_all(buf)?;
@@ -850,11 +850,37 @@ where
         write_data(&nonce.1)?;
     }
 
+    const BUF_SIZE: usize = 64<<10;
+
+    let mut buffer = Box::new([0u8;BUF_SIZE]);
+
+    const CHAN_SIZE: usize = 10;
+    let (write_send,write_recv) = mpsc::sync_channel::<(Box<[u8;BUF_SIZE]>,usize)>(CHAN_SIZE);
+    let (buf_send,buf_recv) = mpsc::sync_channel::<Box<[u8;BUF_SIZE]>>(CHAN_SIZE);
+    for i in 1..CHAN_SIZE {
+        buf_send.send(Box::new([0u8;BUF_SIZE])).unwrap();
+    }
+    let writer_thread = thread::spawn(move || {
+        while let Ok((buf,num_bytes)) = write_recv.recv() {
+            mac_state.update(&buf[..num_bytes]);
+            buf_send.send(buf).unwrap()
+        }
+        mac_state
+    });
+
+    let writer_ref = &mut writer;
+    let buf_recv_ref = &buf_recv;
+    let mut write_data = move |buffer: Box<[u8;BUF_SIZE]>,bytes_read: usize| -> Result<Box<[u8;BUF_SIZE]>, Box<dyn std::error::Error>> {
+        writer_ref.write_all(&buffer[..bytes_read])?;
+        write_send.send((buffer,bytes_read)).unwrap();
+        Ok(buf_recv_ref.recv().unwrap())
+    };
+
     let mut bytes_written = 0usize;
 
     // write the rest of the core ciphertext
     loop {
-        match reader.read(&mut buffer) {
+        match reader.read(&mut buffer[..]) {
             Ok(0) => {
                 break;
             }
@@ -862,10 +888,11 @@ where
                 let ct_buf = &mut buffer[..bytes_read];
                 cipher.try_apply_keystream(ct_buf)?;
 
-                write_data(ct_buf)?;
                 bytes_written = bytes_written
                     .checked_add(ct_buf.len())
                     .ok_or(ScrombleError::Overflow)?;
+
+                buffer = write_data(buffer,bytes_read)?;
             }
             Err(e) => {
                 if ErrorKind::Interrupted != e.kind() {
@@ -874,6 +901,20 @@ where
             }
         }
     }
+
+    drop(write_data);
+    for _ in buf_recv.iter() {}
+
+    drop(buf_recv);
+
+    let mut mac_state = writer_thread.join().unwrap();
+
+    let mut write_data =
+        |buf: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
+            writer.write_all(buf)?;
+            mac_state.update(buf);
+            Ok(())
+        };
 
     // calculate MAXPAD
     let max_pad: f32 = max_pad_factor.unwrap_or_else(|| {
@@ -1171,40 +1212,67 @@ where
         HmacTable::new(mac_state, reader)?;
     let mut cipher = cipher;
 
-    let mut buf = vec![];
-    let mut is_first = true;
     let mut correct_size = 0;
     let mut bytes_written = 0;
-    while let Some(block) = mac_table.next(core::mem::take(&mut buf))? {
-        buf = block;
 
-        let output_slice: &mut [u8] = if is_first {
-            is_first = false;
-            if &buf[..64] != &salt.0 || &buf[64..88] != nonce.0.as_slice()
-            {
-                return Err(ScrombleError::FileChanged.into());
-            }
+    if let Some(mut buf) = mac_table.next(vec![])? { 
+        if &buf[..64] != &salt.0 || &buf[64..88] != nonce.0.as_slice()
+        {
+            return Err(ScrombleError::FileChanged.into());
+        }
 
-            {
-                cipher.try_seek(total_size - 128 - 64 - 8)?;
-                cipher.try_apply_keystream(&mut last_8).unwrap();
-                correct_size = u64::from_le_bytes(last_8);
-                assert!(correct_size <= total_size - 128 - 64 - 8);
-                cipher.try_seek(0u64)?;
-            }
+        {
+            cipher.try_seek(total_size - 128 - 64 - 8)?;
+            cipher.try_apply_keystream(&mut last_8).unwrap();
+            correct_size = u64::from_le_bytes(last_8);
+            assert!(correct_size <= total_size - 128 - 64 - 8);
+            cipher.try_seek(0u64)?;
+        }
 
-            &mut buf[128..]
-        } else {
-            &mut buf
-        };
-
+        let mut output_slice = &mut buf[128..];
         let amount_to_write =
             min(output_slice.len(), correct_size as usize - bytes_written);
-        cipher
-            .try_apply_keystream(&mut output_slice[..amount_to_write])?;
-        writer.write_all(&output_slice[..amount_to_write])?;
+        output_slice = &mut output_slice[..amount_to_write];
+        cipher.try_apply_keystream(output_slice)?;
+        writer.write_all(&output_slice)?;
         bytes_written += amount_to_write;
+
+        const CHAN_SIZE: usize = 10;
+        let (ct_send,ct_recv) = mpsc::sync_channel::<(Vec<u8>,usize)>(CHAN_SIZE);
+        let (pt_send,pt_recv) = mpsc::sync_channel::<Result<(Vec<u8>,usize),ScrombleError>>(CHAN_SIZE);
+        let decrypt_thread = thread::spawn(move || {
+            while let Ok((mut buf,end)) = ct_recv.recv() {
+                let slice = &mut buf[..end];
+                pt_send.send(cipher.try_apply_keystream(slice)
+                    .map(|_| (buf,end))).unwrap();
+            }
+        });
+
+        while let Some(block) = mac_table.next(core::mem::take(&mut buf))? {
+            let amount_to_write = min(block.len(), correct_size as usize - bytes_written);
+            bytes_written += amount_to_write;
+            ct_send.send((block,amount_to_write)).unwrap();
+
+            for pt in pt_recv.try_iter() {
+                let (pt,len) = pt?;
+                writer.write_all(&pt[..len])?;
+
+                buf = pt;
+            }
+        }
+
+        drop(ct_send);
+        for pt in pt_recv.iter() {
+            let (pt,len) = pt?;
+            writer.write_all(&pt[..len])?;
+
+            buf = pt;
+        }
+
+        decrypt_thread.join().unwrap();
+
     }
+
 
     writer.flush()?;
 
