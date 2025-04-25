@@ -854,7 +854,7 @@ where
 
     let mut buffer = Box::new([0u8;BUF_SIZE]);
 
-    const CHAN_SIZE: usize = 10;
+    const CHAN_SIZE: usize = 4;
     let (write_send,write_recv) = mpsc::sync_channel::<(Box<[u8;BUF_SIZE]>,usize)>(CHAN_SIZE);
     let (buf_send,buf_recv) = mpsc::sync_channel::<Box<[u8;BUF_SIZE]>>(CHAN_SIZE);
     for i in 1..CHAN_SIZE {
@@ -1237,7 +1237,7 @@ where
         writer.write_all(&output_slice)?;
         bytes_written += amount_to_write;
 
-        const CHAN_SIZE: usize = 10;
+        const CHAN_SIZE: usize = 4;
         let (ct_send,ct_recv) = mpsc::sync_channel::<(Vec<u8>,usize)>(CHAN_SIZE);
         let (pt_send,pt_recv) = mpsc::sync_channel::<Result<(Vec<u8>,usize),ScrombleError>>(CHAN_SIZE);
         let decrypt_thread = thread::spawn(move || {
