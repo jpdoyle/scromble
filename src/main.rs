@@ -4,12 +4,10 @@
 #[cfg(test)]
 extern crate quickcheck_macros;
 
-// use blake2::Blake2bMac;
 use clap::{StructOpt, ValueEnum};
 use clap_complete::{generate, generate_to, Shell};
 use conv::ApproxFrom;
 use core::cmp::{max, min};
-// use digest::{FixedOutput, Mac};
 use generic_array::{ArrayLength, GenericArray};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -66,7 +64,7 @@ impl std::error::Error for ScrombleError {}
 mod chacha {
     use super::*;
 
-    use zeroize::DefaultIsZeroes; //,Zeroize};//,ZeroizeOnDrop};
+    use zeroize::DefaultIsZeroes;
 
     #[derive(Default, Clone, Copy)]
     struct ChaChaKey(pub [u32; 8]);
@@ -92,85 +90,6 @@ mod chacha {
     /// The ChaCha20 quarter round function
     #[allow(dead_code)]
     #[inline(always)]
-    fn quarter_round(
-        a: usize,
-        b: usize,
-        c: usize,
-        d: usize,
-        state: &mut ChaChaState,
-    ) {
-        state.0[a] = state.0[a].wrapping_add(state.0[b]);
-        state.0[d] ^= state.0[a];
-        state.0[d] = state.0[d].rotate_left(16);
-
-        state.0[c] = state.0[c].wrapping_add(state.0[d]);
-        state.0[b] ^= state.0[c];
-        state.0[b] = state.0[b].rotate_left(12);
-
-        state.0[a] = state.0[a].wrapping_add(state.0[b]);
-        state.0[d] ^= state.0[a];
-        state.0[d] = state.0[d].rotate_left(8);
-
-        state.0[c] = state.0[c].wrapping_add(state.0[d]);
-        state.0[b] ^= state.0[c];
-        state.0[b] = state.0[b].rotate_left(7);
-    }
-
-    /// The ChaCha20 quarter round function
-    // #[inline(always)]
-    fn quarter_rounds(
-        a: [&mut u32; 4],
-        b: [&mut u32; 4],
-        c: [&mut u32; 4],
-        d: [&mut u32; 4],
-    ) {
-        for i in 0..4 {
-            *a[i] = a[i].wrapping_add(*b[i]);
-            *d[i] ^= *a[i];
-            *d[i] = d[i].rotate_left(16);
-
-            *c[i] = c[i].wrapping_add(*d[i]);
-            *b[i] ^= *c[i];
-            *b[i] = b[i].rotate_left(12);
-
-            *a[i] = a[i].wrapping_add(*b[i]);
-            *d[i] ^= *a[i];
-            *d[i] = d[i].rotate_left(8);
-
-            *c[i] = c[i].wrapping_add(*d[i]);
-            *b[i] ^= *c[i];
-            *b[i] = b[i].rotate_left(7);
-        }
-    }
-
-    /// The ChaCha20 quarter round function
-    #[inline(always)]
-    fn quarter_rounds2<const WIDTH: usize>(
-        mut a: [u32; WIDTH],
-        mut b: [u32; WIDTH],
-        mut c: [u32; WIDTH],
-        mut d: [u32; WIDTH],
-    ) -> [[u32;WIDTH];4]{
-        for i in 0..WIDTH {
-            a[i] = a[i].wrapping_add(b[i]);
-            d[i] ^= a[i];
-            d[i] = d[i].rotate_left(16);
-
-            c[i] = c[i].wrapping_add(d[i]);
-            b[i] ^= c[i];
-            b[i] = b[i].rotate_left(12);
-
-            a[i] = a[i].wrapping_add(b[i]);
-            d[i] ^= a[i];
-            d[i] = d[i].rotate_left(8);
-
-            c[i] = c[i].wrapping_add(d[i]);
-            b[i] ^= c[i];
-            b[i] = b[i].rotate_left(7);
-        }
-        [a,b,c,d]
-    }
-
     /// The ChaCha20 quarter round function
     #[inline(always)]
     fn quarter_rounds3<const WIDTH: usize, const HEIGHT: usize>(
@@ -240,16 +159,6 @@ mod chacha {
                 [x15, x12, x13, x14],
             );
 
-            // // column rounds
-            // [x00, x04, x08, x12] = quarter_rounds2::<BATCH_SIZE>(x00, x04, x08, x12);
-            // [x01, x05, x09, x13] = quarter_rounds2::<BATCH_SIZE>(x01, x05, x09, x13);
-            // [x02, x06, x10, x14] = quarter_rounds2::<BATCH_SIZE>(x02, x06, x10, x14);
-            // [x03, x07, x11, x15] = quarter_rounds2::<BATCH_SIZE>(x03, x07, x11, x15);
-            // // diagonal rounds
-            // [x00, x05, x10, x15] = quarter_rounds2::<BATCH_SIZE>(x00, x05, x10, x15);
-            // [x01, x06, x11, x12] = quarter_rounds2::<BATCH_SIZE>(x01, x06, x11, x12);
-            // [x02, x07, x08, x13] = quarter_rounds2::<BATCH_SIZE>(x02, x07, x08, x13);
-            // [x03, x04, x09, x14] = quarter_rounds2::<BATCH_SIZE>(x03, x04, x09, x14);
 
         }
         s = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15];
@@ -263,164 +172,9 @@ mod chacha {
     }
 
     #[inline(always)]
-    fn run_rounds_inner_batch<const DOUBLE_ROUNDS: usize,const BATCH_SIZE: usize>(mut res: [ChaChaState;BATCH_SIZE]) -> [ChaChaState;BATCH_SIZE] {
-        for _ in 0..DOUBLE_ROUNDS {
-
-            for i in 0..(BATCH_SIZE/2) {
-                let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
-                    res[2*i].0;
-                let [y00, y01, y02, y03, y04, y05, y06, y07, y08, y09, y10, y11, y12, y13, y14, y15] =
-                    res[2*i+1].0;
-                // column rounds
-                let [
-                    [x00, x01, x02, x03, y00, y01, y02, y03],
-                    [x04, x05, x06, x07, y04, y05, y06, y07],
-                    [x08, x09, x10, x11, y08, y09, y10, y11],
-                    [x12, x13, x14, x15, y12, y13, y14, y15],
-                ] = quarter_rounds2::<8>(
-                    [x00, x01, x02, x03, y00, y01, y02, y03],
-                    [x04, x05, x06, x07, y04, y05, y06, y07],
-                    [x08, x09, x10, x11, y08, y09, y10, y11],
-                    [x12, x13, x14, x15, y12, y13, y14, y15],
-                );
-
-                // diagonal rounds
-                let [
-                    [x00, x01, x02, x03, y00, y01, y02, y03],
-                    [x05, x06, x07, x04, y05, y06, y07, y04],
-                    [x10, x11, x08, x09, y10, y11, y08, y09],
-                    [x15, x12, x13, x14, y15, y12, y13, y14],
-                ] = quarter_rounds2::<8>(
-                    [x00, x01, x02, x03, y00, y01, y02, y03],
-                    [x05, x06, x07, x04, y05, y06, y07, y04],
-                    [x10, x11, x08, x09, y10, y11, y08, y09],
-                    [x15, x12, x13, x14, y15, y12, y13, y14],
-                );
-
-                res[2*i].0 = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15];
-                res[2*i+1].0 = [y00, y01, y02, y03, y04, y05, y06, y07, y08, y09, y10, y11, y12, y13, y14, y15];
-
-            }
-
-            for i in (2*(BATCH_SIZE/2))..BATCH_SIZE {
-                let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
-                    res[i].0;
-                // column rounds
-                let [
-                    [x00, x01, x02, x03],
-                    [x04, x05, x06, x07],
-                    [x08, x09, x10, x11],
-                    [x12, x13, x14, x15],
-                ] = quarter_rounds2::<4>(
-                    [x00, x01, x02, x03],
-                    [x04, x05, x06, x07],
-                    [x08, x09, x10, x11],
-                    [x12, x13, x14, x15],
-                );
-                // diagonal rounds
-                let [
-                    [x00, x01, x02, x03],
-                    [x05, x06, x07, x04],
-                    [x10, x11, x08, x09],
-                    [x15, x12, x13, x14],
-                ] = quarter_rounds2::<4>(
-                    [x00, x01, x02, x03],
-                    [x05, x06, x07, x04],
-                    [x10, x11, x08, x09],
-                    [x15, x12, x13, x14],
-                );
-
-                res[i].0 = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15]
-
-            }
-
-            // for i in 0..(BATCH_SIZE/2) {
-            //     let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
-            //         res[2*i].0;
-            //     let [y00, y01, y02, y03, y04, y05, y06, y07, y08, y09, y10, y11, y12, y13, y14, y15] =
-            //         res[2*i+1].0;
-
-            //     // diagonal rounds
-            //     let [
-            //         [x00, x01, x02, x03, y00, y01, y02, y03],
-            //         [x05, x06, x07, x04, y05, y06, y07, y04],
-            //         [x10, x11, x08, x09, y10, y11, y08, y09],
-            //         [x15, x12, x13, x14, y15, y12, y13, y14],
-            //     ] = quarter_rounds2::<8>(
-            //         [x00, x01, x02, x03, y00, y01, y02, y03],
-            //         [x05, x06, x07, x04, y05, y06, y07, y04],
-            //         [x10, x11, x08, x09, y10, y11, y08, y09],
-            //         [x15, x12, x13, x14, y15, y12, y13, y14],
-            //     );
-
-            //     res[2*i].0 = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15];
-            //     res[2*i+1].0 = [y00, y01, y02, y03, y04, y05, y06, y07, y08, y09, y10, y11, y12, y13, y14, y15];
-            // }
-
-            // for i in (2*(BATCH_SIZE/2))..BATCH_SIZE {
-            //     let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
-            //         res[i].0;
-            //     // diagonal rounds
-            //     let [
-            //         [x00, x01, x02, x03],
-            //         [x05, x06, x07, x04],
-            //         [x10, x11, x08, x09],
-            //         [x15, x12, x13, x14],
-            //     ] = quarter_rounds2::<4>(
-            //         [x00, x01, x02, x03],
-            //         [x05, x06, x07, x04],
-            //         [x10, x11, x08, x09],
-            //         [x15, x12, x13, x14],
-            //     );
-            //     res[i].0 = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15]
-            // }
-        }
-        res
-    }
-
-    #[inline(always)]
-    fn run_rounds_inner<const DOUBLE_ROUNDS: usize>(mut res: ChaChaState) -> ChaChaState {
-        let [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15] =
-            &mut res.0;
-        for _ in 0..DOUBLE_ROUNDS {
-
-            // column rounds
-            quarter_rounds(
-                [x00, x01, x02, x03],
-                [x04, x05, x06, x07],
-                [x08, x09, x10, x11],
-                [x12, x13, x14, x15],
-            );
-
-            // diagonal rounds
-            quarter_rounds(
-                [x00, x01, x02, x03],
-                [x05, x06, x07, x04],
-                [x10, x11, x08, x09],
-                [x15, x12, x13, x14],
-            );
-        }
-        res
-    }
-
-    #[inline(always)]
-    #[allow(unused)]
-    fn run_rounds<const DOUBLE_ROUNDS: usize>(
-        state: &ChaChaState,
-    ) -> ChaChaState {
-        let mut res = run_rounds_inner::<DOUBLE_ROUNDS>(*state);
-
-        for (s1, s0) in res.0.iter_mut().zip(state.0.iter()) {
-            *s1 = s1.wrapping_add(*s0);
-        }
-        res
-    }
-
-    #[inline(always)]
     fn run_rounds_batch<const DOUBLE_ROUNDS: usize,const BATCH_SIZE: usize>(
         state: [ChaChaState;BATCH_SIZE],
     ) -> [ChaChaState;BATCH_SIZE] {
-        // let mut res = run_rounds_inner_batch::<DOUBLE_ROUNDS,BATCH_SIZE>(*state);
         let mut res = run_rounds_inner_batch_transpose::<DOUBLE_ROUNDS,BATCH_SIZE>(state.clone());
 
         for (i,s) in IntoIterator::into_iter(state).enumerate() {
@@ -451,7 +205,7 @@ mod chacha {
         state.0[4..12].copy_from_slice(&key.0[..]);
         state.0[12..16].copy_from_slice(&nonce.0[..]);
 
-        state = run_rounds_inner::<10>(state);
+        [state] = run_rounds_inner_batch_transpose::<10,1>([state]);
 
         let mut output = ChaChaKey::default();
 
@@ -482,9 +236,6 @@ mod chacha {
         }
 
         states = run_rounds_batch::<10,N_BLOCKS>(states);
-        // for i in 0..N_BLOCKS {
-        //     states[i] = run_rounds::<10>(&states[i]);
-        // }
 
         for i in 0..N_BLOCKS {
             for j in 0..states[i].0.len() {
@@ -924,7 +675,6 @@ where
     <&GenericArray<u8, N>>::from(hasher.finalize().as_bytes()).clone()
 }
 
-// struct RootKey(Zeroizing<Secret<[u8; 64]>>);
 #[derive(Clone, Copy)]
 struct RootKeyInner([u8; 64]);
 impl Default for RootKeyInner {
@@ -937,7 +687,6 @@ struct RootKey(SecretBox<RootKeyInner>);
 
 struct Passphrase(SecretString);
 #[derive(Clone)]
-// struct Nonce(chacha20::XNonce);
 struct Nonce([u8; 24]);
 #[derive(Clone)]
 struct NonceBlock(Nonce, [u8; 40]);
@@ -945,9 +694,7 @@ struct Salt([u8; 64]);
 
 // TODO: figure out how to zeroize these and pin them in place.
 //       It isn't obvious that we can even pin all these.
-// type HmacState = Box<Blake2bMac<U64>>;
 type HmacState = Box<blake2b_simd::State>;
-// type CipherState = Box<chacha20::XChaCha20>;
 
 impl RootKey {
     fn new(pass: Passphrase, salt: &Salt) -> Self {
@@ -1140,7 +887,6 @@ where
     write_data(&length_bytes)?;
 
     // write out the mac (we're done!)
-    // writer.write_all(mac_state.finalize_fixed().as_slice())?;
     writer.write_all(mac_state.finalize().as_bytes())?;
 
     writer.flush()?;
@@ -1153,7 +899,6 @@ const HMAC_SIZE: usize = 64;
 struct HmacTable<R: std::io::Read + std::io::Seek + ?Sized> {
     bytes_remaining: u64,
     block_size: u64,
-    // hashes_reversed: Vec<digest::Output<blake2b_simd::State>>,
     hashes_reversed: Vec<[u8; 64]>,
     bytes_in_buffer: u64,
     inner_buffer: Vec<u8>,
@@ -1186,7 +931,6 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                     total_bytes_read += bytes_read as u64;
                     if bytes_in_buf == buf.len() {
                         hmac.update(&buf[..block_size]);
-                        // prefix_hashes.push(hmac.clone().finalize_fixed());
                         prefix_hashes
                             .push(*hmac.clone().finalize().as_array());
 
@@ -1240,7 +984,6 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
                 .copy_from_slice(&buf[buf_end - l8b_included..buf_end]);
         }
 
-        // let final_mac = hmac.finalize_fixed();
         let final_mac = *hmac.finalize().as_array();
 
         if !<bool>::from(
@@ -1311,7 +1054,6 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
 
                         let segment_hash: [u8; HMAC_SIZE] =
                             *self.hmac.clone().finalize().as_array();
-                        // self.hmac.clone().finalize_fixed().into();
                         let expected_hash = self
                             .hashes_reversed
                             .pop()
@@ -1347,7 +1089,6 @@ impl<R: std::io::Read + std::io::Seek + ?Sized> HmacTable<R> {
         self.hmac
             .update(&buffer[..self.bytes_in_buffer as usize - HMAC_SIZE]);
 
-        // let final_mac = self.hmac.clone().finalize_fixed();
         let final_mac = *self.hmac.clone().finalize().as_array();
         // can be an unwrap()
         let final_hash = self
@@ -1574,6 +1315,12 @@ mod test {
 
     #[quickcheck]
     fn decrypt_wrong_pw(wrong_pw: String, file: ScrombleFile) {
+        let wrong_pw = if wrong_pw == file.pw {
+            format!("{wrong_pw}_")
+        } else {
+            wrong_pw
+        };
+
         let mut enc_file = vec![];
         scromble(
             Passphrase(file.pw.clone().into()),
@@ -1720,11 +1467,6 @@ enum Command {
         outdir: Option<PathBuf>,
     },
 }
-
-// #[test]
-// fn all_sizes_agree() {
-//     assert_eq!(blake2b_simd::OUTBYTES, chacha20::BLOCK_SIZE);
-// }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Command::from_args();
