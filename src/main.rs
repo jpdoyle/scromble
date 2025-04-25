@@ -93,11 +93,11 @@ mod chacha {
     /// The ChaCha20 quarter round function
     #[inline(always)]
     fn quarter_rounds3<const WIDTH: usize, const HEIGHT: usize>(
-        mut a: [[u32; WIDTH];HEIGHT],
-        mut b: [[u32; WIDTH];HEIGHT],
-        mut c: [[u32; WIDTH];HEIGHT],
-        mut d: [[u32; WIDTH];HEIGHT],
-    ) -> [[[u32;WIDTH];HEIGHT];4]{
+        mut a: [[u32; WIDTH]; HEIGHT],
+        mut b: [[u32; WIDTH]; HEIGHT],
+        mut c: [[u32; WIDTH]; HEIGHT],
+        mut d: [[u32; WIDTH]; HEIGHT],
+    ) -> [[[u32; WIDTH]; HEIGHT]; 4] {
         for i in 0..WIDTH {
             for j in 0..HEIGHT {
                 a[j][i] = a[j][i].wrapping_add(b[j][i]);
@@ -117,13 +117,17 @@ mod chacha {
                 b[j][i] = b[j][i].rotate_left(7);
             }
         }
-        [a,b,c,d]
+        [a, b, c, d]
     }
 
-
     #[inline(always)]
-    fn run_rounds_inner_batch_transpose<const DOUBLE_ROUNDS: usize,const BATCH_SIZE: usize>(mut res: [ChaChaState;BATCH_SIZE]) -> [ChaChaState;BATCH_SIZE] {
-        let mut s = [[0u32;BATCH_SIZE];16];
+    fn run_rounds_inner_batch_transpose<
+        const DOUBLE_ROUNDS: usize,
+        const BATCH_SIZE: usize,
+    >(
+        mut res: [ChaChaState; BATCH_SIZE],
+    ) -> [ChaChaState; BATCH_SIZE] {
+        let mut s = [[0u32; BATCH_SIZE]; 16];
         for i in 0..BATCH_SIZE {
             for j in 0..16 {
                 s[j][i] = res[i].0[j];
@@ -133,14 +137,13 @@ mod chacha {
         let [mut x00, mut x01, mut x02, mut x03, mut x04, mut x05, mut x06, mut x07, mut x08, mut x09, mut x10, mut x11, mut x12, mut x13, mut x14, mut x15] =
             s;
         for _ in 0..DOUBLE_ROUNDS {
-
             // column rounds
             [
                 [x00, x01, x02, x03],
                 [x04, x05, x06, x07],
                 [x08, x09, x10, x11],
                 [x12, x13, x14, x15],
-            ] = quarter_rounds3::<BATCH_SIZE,4>(
+            ] = quarter_rounds3::<BATCH_SIZE, 4>(
                 [x00, x01, x02, x03],
                 [x04, x05, x06, x07],
                 [x08, x09, x10, x11],
@@ -152,16 +155,17 @@ mod chacha {
                 [x05, x06, x07, x04],
                 [x10, x11, x08, x09],
                 [x15, x12, x13, x14],
-            ] = quarter_rounds3::<BATCH_SIZE,4>(
+            ] = quarter_rounds3::<BATCH_SIZE, 4>(
                 [x00, x01, x02, x03],
                 [x05, x06, x07, x04],
                 [x10, x11, x08, x09],
                 [x15, x12, x13, x14],
             );
-
-
         }
-        s = [x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12, x13, x14, x15];
+        s = [
+            x00, x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11,
+            x12, x13, x14, x15,
+        ];
 
         for i in 0..BATCH_SIZE {
             for j in 0..16 {
@@ -172,13 +176,21 @@ mod chacha {
     }
 
     #[inline(always)]
-    fn run_rounds_batch<const DOUBLE_ROUNDS: usize,const BATCH_SIZE: usize>(
-        state: [ChaChaState;BATCH_SIZE],
-    ) -> [ChaChaState;BATCH_SIZE] {
-        let mut res = run_rounds_inner_batch_transpose::<DOUBLE_ROUNDS,BATCH_SIZE>(state.clone());
+    fn run_rounds_batch<
+        const DOUBLE_ROUNDS: usize,
+        const BATCH_SIZE: usize,
+    >(
+        state: [ChaChaState; BATCH_SIZE],
+    ) -> [ChaChaState; BATCH_SIZE] {
+        let mut res = run_rounds_inner_batch_transpose::<
+            DOUBLE_ROUNDS,
+            BATCH_SIZE,
+        >(state.clone());
 
-        for (i,s) in IntoIterator::into_iter(state).enumerate() {
-            for (s1, s0) in res[i].0.iter_mut().zip(IntoIterator::into_iter(s.0)) {
+        for (i, s) in IntoIterator::into_iter(state).enumerate() {
+            for (s1, s0) in
+                res[i].0.iter_mut().zip(IntoIterator::into_iter(s.0))
+            {
                 *s1 = s1.wrapping_add(s0);
             }
         }
@@ -205,7 +217,7 @@ mod chacha {
         state.0[4..12].copy_from_slice(&key.0[..]);
         state.0[12..16].copy_from_slice(&nonce.0[..]);
 
-        [state] = run_rounds_inner_batch_transpose::<10,1>([state]);
+        [state] = run_rounds_inner_batch_transpose::<10, 1>([state]);
 
         let mut output = ChaChaKey::default();
 
@@ -219,10 +231,10 @@ mod chacha {
     fn chacha20_apply_blocks<const N_BLOCKS: usize>(
         key: &ChaChaKey,
         nonce: &ChaChaNonce,
-        block_ixs: [u64;N_BLOCKS],
-        pt: &mut [[u8;64]; N_BLOCKS],
+        block_ixs: [u64; N_BLOCKS],
+        pt: &mut [[u8; 64]; N_BLOCKS],
     ) {
-        let mut states = [ChaChaState::default();N_BLOCKS];
+        let mut states = [ChaChaState::default(); N_BLOCKS];
 
         for i in 0..N_BLOCKS {
             states[i].0[..4].copy_from_slice(&CONSTANTS);
@@ -235,7 +247,7 @@ mod chacha {
             states[i].0[15] = nonce.0[1];
         }
 
-        states = run_rounds_batch::<10,N_BLOCKS>(states);
+        states = run_rounds_batch::<10, N_BLOCKS>(states);
 
         for i in 0..N_BLOCKS {
             for j in 0..states[i].0.len() {
@@ -348,12 +360,17 @@ mod chacha {
 
             if offset > 0 {
                 let num_bytes = min(buffer.len(), 64 - (offset as usize));
-                let mut block = [[0u8; 64];1];
+                let mut block = [[0u8; 64]; 1];
                 let off = offset as usize;
                 block[0][off..off + num_bytes]
                     .copy_from_slice(&buffer[..num_bytes]);
 
-                chacha20_apply_blocks::<1>(key, nonce, [block_ix], &mut block);
+                chacha20_apply_blocks::<1>(
+                    key,
+                    nonce,
+                    [block_ix],
+                    &mut block,
+                );
 
                 buffer[..num_bytes]
                     .copy_from_slice(&block[0][off..off + num_bytes]);
@@ -383,20 +400,19 @@ mod chacha {
                         .ok_or(ScrombleError::Overflow)?;
                 }
 
-                let mut block = [[0u8; 64];N_CHUNKS];
+                let mut block = [[0u8; 64]; N_CHUNKS];
                 for i in 0..N_CHUNKS {
-                    block[i][..].copy_from_slice(&buffer[i*64..64*(i+1)]);
+                    block[i][..]
+                        .copy_from_slice(&buffer[i * 64..64 * (i + 1)]);
                 }
 
                 chacha20_apply_blocks::<N_CHUNKS>(
-                    key,
-                    nonce,
-                    ixs,
-                    &mut block,
+                    key, nonce, ixs, &mut block,
                 );
 
                 for i in 0..N_CHUNKS {
-                    buffer[i*64..64*(i+1)].copy_from_slice(&block[i][..]);
+                    buffer[i * 64..64 * (i + 1)]
+                        .copy_from_slice(&block[i][..]);
                 }
 
                 match block_ix.checked_add(N_CHUNKS as u64) {
@@ -413,10 +429,15 @@ mod chacha {
             }
 
             while buffer.len() >= 64 {
-                let mut block = [[0u8; 64];1];
+                let mut block = [[0u8; 64]; 1];
                 block[0][..].copy_from_slice(&buffer[..64]);
 
-                chacha20_apply_blocks::<1>(key, nonce, [block_ix], &mut block);
+                chacha20_apply_blocks::<1>(
+                    key,
+                    nonce,
+                    [block_ix],
+                    &mut block,
+                );
 
                 buffer[..64].copy_from_slice(&block[0][..]);
 
@@ -440,7 +461,12 @@ mod chacha {
                 let mut block = [[0u8; 64]; 1];
                 block[0][..buffer.len()].copy_from_slice(&buffer[..]);
 
-                chacha20_apply_blocks::<1>(key, nonce, [block_ix], &mut block);
+                chacha20_apply_blocks::<1>(
+                    key,
+                    nonce,
+                    [block_ix],
+                    &mut block,
+                );
 
                 let buflen = buffer.len();
                 buffer[..].copy_from_slice(&block[0][..buflen]);
@@ -1293,7 +1319,7 @@ mod test {
         .unwrap();
 
         let corruption_pos = (corruption_pos as usize) % enc_file.len();
-        for (i, x) in core::iter::once(corruption_mask.0|1)
+        for (i, x) in core::iter::once(corruption_mask.0 | 1)
             .chain((corruption_mask.1).into_iter())
             .enumerate()
         {
